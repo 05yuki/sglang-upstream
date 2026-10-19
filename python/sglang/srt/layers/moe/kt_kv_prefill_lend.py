@@ -48,6 +48,9 @@ from sglang.srt.layers.moe import kt_kv_vmm
 ENABLED = os.environ.get("KT_PREFILL_KV_LEND", "0") == "1" and kt_kv_vmm.ENABLED
 HOT = os.environ.get("KT_KV_HOT_LEND", "0") == "1" and kt_kv_vmm.ENABLED
 PRE_RESTORE = []  # fn(why), run before lent pages are mapped back (the hot lend's slots out)
+# fn(why), run when a window opens before the weights are paused (the hot lend's resident
+# rows back to experts 0..N-1: kv-hot-lend-rows-home.py)
+WINDOW_START = []
 RESERVE = int(os.environ.get("KT_PREFILL_KV_LEND_RESERVE", "4096"))  # tokens kept free beyond the prompt
 CHECK = os.environ.get("KT_PREFILL_KV_LEND_CHECK", "0") == "1"
 # KT_PREFILL_KV_LEND_VERIFY=1: every page in use when a window lends (but the
@@ -313,6 +316,9 @@ def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
 
 def hot_release(why: str) -> None:
     """Give back what the hot lend holds (a window opens, the pool is cleared)."""
+    if why == "window start":
+        for fn in WINDOW_START:
+            fn(why)
     if STATE["lent"] is not None and STATE.get("owner") == "hot":
         restore(why)
 

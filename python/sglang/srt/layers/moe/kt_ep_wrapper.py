@@ -308,6 +308,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             params_dtype=params_dtype,
             **extra_weight_attrs,
         )
+        # kt_kv_hot_lend: the next X experts' weights on a shadow layer, for the
+        # KV pool's free pages
+        from sglang.srt.layers.moe import kt_kv_hot_lend
+
+        kt_kv_hot_lend.make_shadow(self, layer, hidden_size, intermediate_size_per_partition,
+                                   params_dtype, extra_weight_attrs)
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
@@ -316,7 +322,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # GPU-resident experts instead of num_gpu_experts (SFT-only).
             # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
             gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
-            gpu_mask[: self.num_gpu_experts] = True
+            # kt_kv_hot_lend's dynamic resident rows: kt-kernel loads every expert, the
+            # routes say what it computes (-1 for what the GPU takes)
+            if not kt_kv_hot_lend.cpu_holds_all(self):
+                gpu_mask[: self.num_gpu_experts] = True
             KT_LAYERS[self.kt_config.layer_idx] = self
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
@@ -373,6 +382,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
             _drop_checkpoint_cache(self.kt_config.layer_idx, getattr(self.kt_config, "num_layers", 0) or 0)
             self.wrapper.load_weights(physical_to_logical_map_cpu)
+        # kt_kv_hot_lend: experts N..N+X-1 to pinned memory and the shadow slots
+        from sglang.srt.layers.moe import kt_kv_hot_lend
+
+        kt_kv_hot_lend.split(self, layer)
         # Last layer loaded on this rank: optionally build the streamer and
         # pin every layer's arenas now (KT_GPU_STREAM_EARLY_INIT).
         num_layers = getattr(self.kt_config, "num_layers", None)
@@ -501,6 +514,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # experts are streamed to the GPU in groups instead of computed here
         # (kt_stream_prefill.py). The ids are taken before the mask below
         # mutates them in place.
+        # kt_kv_hot_lend: a prefill window finds the resident rows holding 0..N-1
+        from sglang.srt.layers.moe import kt_kv_hot_lend
+
+        kt_kv_hot_lend.res_guard()
         streamer = stream_prefill_for(self, layer, x.shape[0])
         cpu_share = False
         if streamer is not None:
@@ -514,9 +531,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # Everything below the cutoff is streamed or resident: send it
                 # to GPU expert 0 at weight 0, which kt-kernel skips.
                 theirs = physical_ids < cutoff
+                # (-1 when kt-kernel holds every expert: it would compute expert 0)
+                skip = -1 if kt_kv_hot_lend.cpu_holds_all(self) else 0
                 cpu_do = dispatch_output._replace(
                     topk_output=topk_output._replace(
-                        topk_ids=torch.where(theirs, torch.zeros_like(physical_ids), physical_ids),
+                        topk_ids=torch.where(theirs, torch.full_like(physical_ids, skip), physical_ids),
                         topk_weights=torch.where(
                             theirs, torch.zeros_like(topk_output.topk_weights), topk_output.topk_weights
                         ),
@@ -525,15 +544,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 self.submit(layer, cpu_do)
                 cpu_share = True
 
+        # kt_kv_hot_lend: routes to the experts lent the KV pool's free pages go to
+        # their slots, and to the CPU at weight 0
+        hot = kt_kv_hot_lend.route(self, dispatch_output) if streamer is None else None
 
         # Step 1: Submit CPU expert computation (non-blocking)
         if streamer is None and self.tp_rank == 0:
-            self.submit(layer, dispatch_output)
+            self.submit(layer, hot[0] if hot is not None else dispatch_output)
 
         # Step 2: Prepare GPU computation by masking CPU expert IDs
         # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
         topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+        if hot is not None and hot[3] is not None:
+            # kt_kv_hot_lend's dynamic resident rows: the row each route's expert is in
+            masked_topk_ids = hot[3]
+        else:
+            masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
 
         # Create modified dispatch output for GPU computation
         if _gpu_mask_zero:
@@ -569,6 +595,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 hot_reference_check(self, layer, x, physical_ids, topk_output.topk_weights, output, streamer)
         else:
             output = torch.zeros_like(x)
+        if hot is not None and hot[1] is not None:
+            output = output + kt_kv_hot_lend.apply(self, hot[1])
 
         # Step 4: Synchronize CPU results and merge with GPU results
         if streamer is not None:
@@ -579,6 +607,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             cpu_output = self.sync(x)
             output = output + cpu_output
 
+        kt_kv_hot_lend.check(self, layer, dispatch_output, hot, output)
         return StandardCombineInput(hidden_states=output)
 
     def __getattr__(self, name: str):
