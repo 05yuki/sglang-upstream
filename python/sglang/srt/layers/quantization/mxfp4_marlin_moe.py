@@ -211,3 +211,35 @@ class Mxfp4MarlinMoEMethod:
         )
 
         return StandardCombineInput(hidden_states=runner_output.hidden_states)
+
+
+class Mxfp4Fp32MoEMethod(Mxfp4MarlinMoEMethod):
+    """MXFP4 MoE in the checkpoint's layout through Triton kernels with one rounding
+    (sglang-mxfp4-fp32-moe.py). The Marlin runner is still created for its config (the
+    SwiGLU clamp the streamed prefill and the kernels read); its kernel is not used."""
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        self._fp8.process_weights_after_loading(layer)
+        if getattr(layer, "_mega_moe_weights_built", False):
+            return
+        if self.runner.config.gemm1_alpha is not None:
+            raise RuntimeError("SGLANG_MXFP4_MOE_FP32: gemm1_alpha (GPT-OSS SwiGLU) is not supported")
+        layer._dsv4_mxfp4_backend = "mxfp4_fp32"
+
+    def apply(self, layer: Module, dispatch_output: DispatchOutput) -> CombineInput:
+        from sglang.srt.layers.moe.mxfp4_fp32_moe import mxfp4_fp32_moe
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+        topk_output = dispatch_output.topk_output
+        cfg = self.runner.config
+        out = mxfp4_fp32_moe(
+            dispatch_output.hidden_states,
+            layer.w13_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight,
+            layer.w2_weight_scale_inv,
+            topk_output.topk_weights,
+            topk_output.topk_ids,
+            swiglu_limit=cfg.swiglu_limit,
+        )
+        return StandardCombineInput(hidden_states=out)

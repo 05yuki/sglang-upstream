@@ -109,6 +109,59 @@ def get_scalar_type(
         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
 
 
+# sglang-marlin-moe-fp32-glue.py
+_FP32_GLUE = __import__("os").environ.get("SGLANG_MARLIN_MOE_FP32_GLUE", "0") == "1"
+
+
+@triton.jit
+def _swiglu_fp32_kernel(in_ptr, out_ptr, d, limit, HAS_LIMIT: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = cols < d
+    g = tl.load(in_ptr + row * 2 * d + cols, mask=m, other=0.0).to(tl.float32)
+    u = tl.load(in_ptr + row * 2 * d + d + cols, mask=m, other=0.0).to(tl.float32)
+    if HAS_LIMIT:
+        g = tl.minimum(g, limit)
+        u = tl.minimum(tl.maximum(u, -limit), limit)
+    h = g / (1.0 + tl.exp(-g)) * u
+    tl.store(out_ptr + row * d + cols, h.to(out_ptr.dtype.element_ty), mask=m)
+
+
+def _swiglu_fp32(output: torch.Tensor, input: torch.Tensor, limit) -> None:
+    """silu(gate) * up of [rows, 2d] bf16 (gate first) in fp32, one rounding into output."""
+    rows, d = input.shape[0], input.shape[1] // 2
+    if rows == 0:
+        return
+    assert input.is_contiguous() and output.is_contiguous()
+    lim = float(limit) if limit else 0.0
+    BLOCK = 1024
+    _swiglu_fp32_kernel[(rows, triton.cdiv(d, BLOCK))](input, output, d, lim, HAS_LIMIT=lim > 0, BLOCK=BLOCK)
+
+
+@triton.jit
+def _topk_wsum_fp32_kernel(y_ptr, w_ptr, out_ptr, K, scale, TOPK: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = cols < K
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for t in tl.static_range(TOPK):
+        wt = tl.load(w_ptr + row * TOPK + t).to(tl.float32)
+        y = tl.load(y_ptr + (row * TOPK + t) * K + cols, mask=m, other=0.0).to(tl.float32)
+        acc += wt * y
+    tl.store(out_ptr + row * K + cols, (acc * scale).to(out_ptr.dtype.element_ty), mask=m)
+
+
+def _topk_wsum_fp32(y: torch.Tensor, weights: torch.Tensor, output: torch.Tensor, scale: float) -> None:
+    """output[m] = scale * sum_t weights[m, t] * y[m, t] in fp32, one rounding."""
+    M, topk, K = y.shape
+    if M == 0:
+        return
+    weights = weights.contiguous()
+    assert y.is_contiguous() and output.is_contiguous() and weights.shape == (M, topk)
+    BLOCK = 1024
+    _topk_wsum_fp32_kernel[(M, triton.cdiv(K, BLOCK))](y, weights, output, K, float(scale), TOPK=topk, BLOCK=BLOCK)
+
+
 def swiglu_limit_func(
     output: torch.Tensor,
     input: torch.Tensor,  # first half is gate, second half is up
@@ -353,6 +406,9 @@ def fused_marlin_moe(
             clamp_limit,
             out=intermediate_cache2,
         )
+    elif activation == "silu" and is_gated and _FP32_GLUE:
+        # sglang-marlin-moe-fp32-glue.py: fp32 SwiGLU, one rounding
+        _swiglu_fp32(intermediate_cache2, intermediate_cache1.view(-1, gemm1_n), clamp_limit)
     elif activation == "silu" and is_gated and clamp_limit is not None:
         swiglu_limit_func(
             intermediate_cache2,
@@ -393,7 +449,8 @@ def fused_marlin_moe(
         topk_weights,
         moe_block_size=block_size_m,
         top_k=1,
-        mul_topk_weights=True,
+        # sglang-marlin-moe-fp32-glue.py: the weights go on in fp32 in the sum below
+        mul_topk_weights=not _FP32_GLUE,
         zero_inactive_output=True,
         is_ep=expert_map is not None,
         expert_ids_are_sorted=expert_map is None,
@@ -414,6 +471,13 @@ def fused_marlin_moe(
     output = zero_copy_context.get_moe_output(hidden_states)
     if output is None:
         output = hidden_states if inplace else torch.empty_like(hidden_states)
+
+    if _FP32_GLUE:
+        # sglang-marlin-moe-fp32-glue.py: the routes' outputs times their weights, summed
+        # in fp32; the MXFP4 path's weights already carry routed scaling
+        scale = 1.0 if is_mxfp4_marlin or routed_scaling_factor is None else routed_scaling_factor
+        _topk_wsum_fp32(intermediate_cache3, topk_weights, output, scale)
+        return output
 
     if is_mxfp4_marlin:
         # Top-k weights (incl. routed scaling) are already applied above via
