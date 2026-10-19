@@ -1302,6 +1302,11 @@ class ModelRunner:
 
     def load_model(self):
         tic_total = time.perf_counter()
+        if __import__("os").environ.get("KT_LAUNCH_TIMING") == "1":
+            # patches/sglang-kt-launch-timing.py
+            from sglang.srt.layers.moe import kt_launch_timing
+
+            kt_launch_timing.install(self)
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
