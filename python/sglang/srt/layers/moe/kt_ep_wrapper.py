@@ -115,6 +115,9 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
     return topk_ids
 
 
+_gpu_mask_zero = os.environ.get("KT_GPU_MASK_ZERO") == "1"
+
+
 def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
     """{"swiglu_limit": limit} for KTMoEWrapper when the layer clamps its SwiGLU, else {}.
     The value is what the resident GPU runner applies: moe_runner_config.swiglu_limit
@@ -393,7 +396,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
 
         # Create modified dispatch output for GPU computation
-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
+        if _gpu_mask_zero:
+            # KT_GPU_MASK_ZERO=1: the Marlin MoE path cannot take -1 ids (its
+            # alignment kernels index weights with them: illegal address at
+            # graph capture). Send the CPU-bound rows to GPU expert 0 with a
+            # zero routing weight instead (the second GEMM multiplies by the
+            # weight, so they add nothing) and hand the ids over as int64 so
+            # fused_marlin_moe takes its generic alignment path.
+            m = masked_topk_ids < 0
+            masked_topk_output = topk_output._replace(
+                topk_ids=torch.where(m, torch.zeros_like(masked_topk_ids), masked_topk_ids).to(torch.int64),
+                topk_weights=torch.where(m, torch.zeros_like(topk_output.topk_weights), topk_output.topk_weights),
+            )
+        else:
+            masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
         masked_dispatch_output = dispatch_output._replace(
             topk_output=masked_topk_output
         )
