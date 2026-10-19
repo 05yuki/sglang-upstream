@@ -369,6 +369,14 @@ class DSparkAttention(MqaAttentionBase):
             self.n_local_groups,
             o.shape[1] * o.shape[2] // self.n_local_groups,
         )
+        import os
+
+        # sglang-dsv4-o-fp8-qdq.py: the 1017 reference quantizes o before wo_a here too
+        _qdq = int(os.environ.get("SGLANG_DSV4_O_FP8_QDQ_BLOCK", "0") or 0)
+        if _qdq:
+            from sglang.srt.models.deepseek_common.o_fp8_qdq import o_fp8_qdq_
+
+            o = o_fp8_qdq_(o, _qdq)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if self._use_fast_kernel:
             o = _apply_wo_a_bf16_matmul(
