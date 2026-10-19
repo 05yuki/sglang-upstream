@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -456,9 +457,13 @@ class Fp8Config(QuantizationConfig):
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+                    Mxfp4Fp32MoEMethod,
                     Mxfp4MarlinMoEMethod,
                 )
 
+                # sglang-mxfp4-fp32-moe.py: the checkpoint's layout, one rounding
+                if os.environ.get("SGLANG_MXFP4_MOE_FP32") == "1":
+                    return Mxfp4Fp32MoEMethod(fp8_method, prefix=prefix)
                 return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_humming():
