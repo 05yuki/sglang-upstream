@@ -1503,6 +1503,12 @@ class Engram(nn.Module):
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
             # empty M.
             return x
+        return self.gate_rows(x, emb, input_ids)
+
+    def gate_rows(
+        self, x: torch.Tensor, emb: torch.Tensor, input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """The layer's output from its looked-up rows `emb` (the tail of forward)."""
         kv, _ = self.wkv(emb.flatten(-2))
         image_ids = input_ids if self.image_token_id is not None else None
         return engram_gate(
