@@ -473,6 +473,79 @@ def _o_fp8_qdq_block() -> int:
 _O_FP8_QDQ_BLOCK = _o_fp8_qdq_block()
 
 
+def _vision_on_demand() -> bool:
+    """SGLANG_DSV4_VISION_ON_DEMAND=1: the vision tower lives in pinned host memory and
+    comes to the GPU only while a batch's images are encoded."""
+    import os
+
+    return os.environ.get("SGLANG_DSV4_VISION_ON_DEMAND", "0") == "1"
+
+
+_VISION_ON_DEMAND = _vision_on_demand()
+
+
+def _vision_offload(model) -> None:
+    """After loading: the vision tower's parameters to pinned host memory, their GPU
+    storage freed."""
+    if not _VISION_ON_DEMAND or getattr(model, "vision", None) is None:
+        return
+    store, nbytes = [], 0
+    for mod in (model.vision, getattr(model, "aligner", None)):
+        if mod is None:
+            continue
+        for p in mod.parameters():
+            if not p.is_cuda or p.numel() == 0:
+                continue
+            host = torch.empty(p.shape, dtype=p.dtype, pin_memory=True)
+            host.copy_(p.data)
+            store.append((p, host))
+            nbytes += p.numel() * p.element_size()
+            p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    model._vision_store = store
+    model._vision_resident = False
+    logger.info(
+        "vision tower on demand: %.1f MiB of %d parameters moved to pinned host memory",
+        nbytes / 2**20,
+        len(store),
+    )
+    try:
+        # the prefill plan gives a request with images that much less room
+        from sglang.srt.layers.moe import kt_prefill_plan
+
+        kt_prefill_plan.on_demand("vision tower", nbytes)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _vision_on_gpu(model):
+    """Around an image batch: the tower's parameters back on the GPU, freed after."""
+    store = getattr(model, "_vision_store", None)
+    if not store or getattr(model, "_vision_resident", False):
+        yield
+        return
+    try:
+        from sglang.srt.layers.moe import kt_kv_prefill_lend
+
+        kt_kv_prefill_lend.hot_release("vision tower")
+    except Exception:
+        pass
+    dev = store[0][0].device
+    for p, host in store:
+        p.data = torch.empty(host.shape, dtype=host.dtype, device=dev)
+        p.data.copy_(host, non_blocking=True)
+    model._vision_resident = True
+    try:
+        yield
+    finally:
+        # frees are stream-ordered: the encoding's kernels finish before reuse
+        for p, host in store:
+            p.data = torch.empty(0, dtype=host.dtype, device=dev)
+        model._vision_resident = False
+
+
 def _wo_a_fp8_native() -> bool:
     """SGLANG_DSV4_WO_A_FP8_NATIVE=1: wo_a stays in the checkpoint's FP8 blocks (any block
     size), read by a GEMV in single-token decode and dequantized for other forwards."""
@@ -4877,17 +4950,19 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def _prepare_mm_embeddings(self, input_ids, forward_batch):
         # Keep scheduler hash IDs intact: the shared embedder clamps its input in place.
-        input_embeds, _ = embed_mm_inputs(
-            mm_inputs_list=[
-                item if item is not None else MultimodalInputs(mm_items=[])
-                for item in forward_batch.mm_inputs
-            ],
-            extend_prefix_lens=forward_batch.extend_prefix_lens_cpu,
-            extend_seq_lens=forward_batch.extend_seq_lens_cpu,
-            input_ids=input_ids.clone(),
-            input_embedding=self.get_input_embeddings(),
-            multimodal_model=self,
-        )
+        # With SGLANG_DSV4_VISION_ON_DEMAND the tower is on the GPU for this batch only.
+        with _vision_on_gpu(self):
+            input_embeds, _ = embed_mm_inputs(
+                mm_inputs_list=[
+                    item if item is not None else MultimodalInputs(mm_items=[])
+                    for item in forward_batch.mm_inputs
+                ],
+                extend_prefix_lens=forward_batch.extend_prefix_lens_cpu,
+                extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+                input_ids=input_ids.clone(),
+                input_embedding=self.get_input_embeddings(),
+                multimodal_model=self,
+            )
         forward_batch.mm_input_embeds = input_embeds
         return input_embeds
 
@@ -5102,6 +5177,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if not is_nextn:
+            _vision_offload(self)
             _setup_wo_a_native(self)
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
