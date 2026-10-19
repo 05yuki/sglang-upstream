@@ -38,6 +38,42 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 
+
+def _drop_checkpoint_cache(layer_idx: int, num_layers: int = 0) -> None:
+    """KT_GPU_STREAM_DROP_CACHE=<dir>: posix_fadvise(DONTNEED) every file
+    under it, so the arenas kt-kernel is about to create find free 2 MB
+    blocks (patches/sglang-kt-drop-cache-per-layer.py)."""
+    import os
+    import time
+
+    root_dir = os.environ.get("KT_GPU_STREAM_DROP_CACHE", "")
+    if not root_dir:
+        return
+    # the loader's prefetch evicts each finished layer itself; a whole-tree
+    # drop here would throw away the next layer's background read
+    # (the loader reads the last KT_LOAD_PREFETCH_TAIL layers after their
+    # arena exists; this drop runs again for them so the arena finds 2 MB
+    # blocks, as it did before the prefetch)
+    if layer_idx > 0 and int(os.environ.get("KT_LOAD_PREFETCH", "0") or 0) > 0:
+        tail = int(os.environ.get("KT_LOAD_PREFETCH_TAIL", "4"))
+        if not num_layers or layer_idx < num_layers - tail - 1:
+            return
+    t0, n = time.time(), 0
+    for root, _, files in os.walk(root_dir, followlinks=True):
+        for name in files:
+            try:
+                fd = os.open(os.path.join(root, name), os.O_RDONLY)
+            except OSError:
+                continue
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                n += 1
+            finally:
+                os.close(fd)
+    if layer_idx == 0 or os.environ.get("KT_GPU_STREAM_TIMING") == "1":
+        print(f"[kt-stream] layer {layer_idx}: dropped the page cache of {n} files in "
+              f"{time.time() - t0:.1f} s", flush=True)
+
 @dataclass
 class KTConfig:
     """Configuration for KTransformers heterogeneous computing CPU part.
@@ -257,7 +293,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
+                # patches/sglang-kt-swiglu-clamp.py (KT_SWIGLU_CLAMP)
                 **_kt_swiglu_kwargs(layer),
+                # KT_NUMA_NODES="1" pins a single pool to node 1, the node
+                # that does not host the TP0 scheduler, for the prefill-decay
+                # isolation; unset keeps kt-kernel's sequential default.
+                numa_nodes=(
+                    [int(x) for x in os.environ["KT_NUMA_NODES"].split(",")]
+                    if os.environ.get("KT_NUMA_NODES")
+                    else None
+                ),
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -267,7 +312,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
         """
         # 1. Process GPU weights
-        if hasattr(self.gpu_method, "process_weights_after_loading"):
+        # Empty resident weights need no GPU repacking; still load CPU experts below.
+        # (dsv41-flash-dual-epyc#2)
+        if self.num_gpu_experts > 0 and hasattr(
+            self.gpu_method, "process_weights_after_loading"
+        ):
             self.gpu_method.process_weights_after_loading(layer)
 
         # 2. Load CPU weights using KT wrapper
@@ -284,6 +333,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 .physical_to_logical_map_cpu[self.kt_config.layer_idx]
                 .contiguous()
             )
+            _drop_checkpoint_cache(self.kt_config.layer_idx, getattr(self.kt_config, "num_layers", 0) or 0)
             self.wrapper.load_weights(physical_to_logical_map_cpu)
 
     def create_moe_runner(
