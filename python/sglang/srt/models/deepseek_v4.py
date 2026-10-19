@@ -461,6 +461,17 @@ def _fused_wo_a_arch_supported() -> bool:
     return _is_cuda and torch.cuda.get_device_capability()[0] == 10
 
 
+def _o_fp8_qdq_block() -> int:
+    """SGLANG_DSV4_O_FP8_QDQ_BLOCK (sglang-dsv4-o-fp8-qdq.py): FP8 quant-dequant of the
+    attention output before a bf16 wo_a, in blocks of this many; 0 = off."""
+    import os
+
+    return int(os.environ.get("SGLANG_DSV4_O_FP8_QDQ_BLOCK", "0") or 0)
+
+
+_O_FP8_QDQ_BLOCK = _o_fp8_qdq_block()
+
+
 def _apply_wo_a_bf16_matmul(
     o: torch.Tensor,
     wo_a: torch.Tensor,
@@ -2927,6 +2938,10 @@ class MQALayer(MqaAttentionBase):
                     recipe=recipe,
                 )
             else:
+                if _O_FP8_QDQ_BLOCK:
+                    from sglang.srt.models.deepseek_common.o_fp8_qdq import o_fp8_qdq_
+
+                    o = o_fp8_qdq_(o, _O_FP8_QDQ_BLOCK)
                 wo_a_weight = getattr(self.wo_a, "weight", None)
                 if wo_a_weight is not None:
                     if (
