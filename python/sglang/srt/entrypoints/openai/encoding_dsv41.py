@@ -113,17 +113,63 @@ def to_json(value: Any) -> str:
 
 
 def tools_from_openai_format(tools):
-    return [tool["function"] for tool in tools]
+    """Extract function definitions with namespace-qualified names."""
+    # sglang-dsv41-encoding-namespace-turns.py: reference dba1be0a40aa
+    functions = []
+    for tool in tools:
+        function = dict(tool["function"])
+        if tool.get("namespace") is not None:
+            function["namespace"] = tool["namespace"]
+        function["name"] = _tool_name_for_encoding(function)
+        namespace = function.pop("namespace", None)
+        if isinstance(namespace, dict) and namespace.get("description"):
+            function["description"] = (
+                namespace["description"] + "\n" + (function.get("description") or "")
+            )
+        functions.append(function)
+    return functions
+
+
+def _split_tool_name(
+    name: str, namespace: Optional[str] = None
+) -> Tuple[Optional[str], str]:
+    """Split a qualified name and validate any explicit namespace."""
+    prefix, separator, bare_name = name.partition("::")
+    if separator:
+        if namespace not in (None, prefix):
+            raise ValueError(f"Conflicting tool namespaces: {namespace} != {prefix}")
+        namespace, name = prefix, bare_name
+    if "::" in name:
+        raise ValueError(f"Tool name must not contain '::': {name}")
+    if namespace is not None and "::" in namespace:
+        raise ValueError(f"Tool namespace must not contain '::': {namespace}")
+    return namespace, name
+
+
+def _tool_name_for_encoding(tool: Dict[str, Any]) -> str:
+    """`namespace::name` for a function or call dict, the bare name without one."""
+    namespace = tool.get("namespace")
+    if isinstance(namespace, dict):
+        if not namespace.get("name"):
+            raise ValueError(f"Tool namespace object has no name: {namespace}")
+        namespace = namespace["name"]
+    namespace, name = _split_tool_name(tool["name"], namespace)
+    return name if namespace is None else f"{namespace}::{name}"
 
 
 def tool_calls_from_openai_format(tool_calls):
-    return [
-        {
-            "name": tool_call["function"]["name"],
-            "arguments": tool_call["function"]["arguments"],
-        }
-        for tool_call in tool_calls
-    ]
+    """Convert OpenAI-format tool calls to internal format."""
+    calls = []
+    for tool_call in tool_calls:
+        function = tool_call["function"]
+        namespace, name = _split_tool_name(
+            function["name"], tool_call.get("namespace") or function.get("namespace")
+        )
+        call = {"name": name, "arguments": function["arguments"]}
+        if namespace is not None:
+            call["namespace"] = namespace
+        calls.append(call)
+    return calls
 
 
 def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
@@ -341,7 +387,7 @@ def render_message(
                 tool_call_template.format(
                     dsml_token=dsml_token,
                     tool_call_tag_name=tool_call_tag_name,
-                    name=tc.get("name"),
+                    name=_tool_name_for_encoding(tc),
                     arguments=encode_arguments_to_dsml(tc),
                 )
                 for tc in tool_calls

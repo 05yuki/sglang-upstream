@@ -2634,6 +2634,8 @@ class OpenAIServingChat(OpenAIServingBase):
                                     name=call_info.name,
                                     arguments=call_info.parameters,
                                 ),
+                                # sglang-dsv41-encoding-namespace-turns.py
+                                namespace=getattr(call_info, "namespace", None),
                             )
                         )
                     if finish_reason["type"] == "stop":
@@ -3134,6 +3136,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     name=function_name,
                     arguments=call_item.parameters,
                 ),
+                # sglang-dsv41-encoding-namespace-turns.py: with the name chunk only
+                namespace=call_item.namespace if call_item.name else None,
             )
 
             choice_data = ChatCompletionResponseStreamChoice(
