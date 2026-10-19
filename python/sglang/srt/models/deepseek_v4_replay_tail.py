@@ -154,6 +154,8 @@ class DecoderReplayTail:
 
     @classmethod
     def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
+        from sglang.srt.layers.moe import kt_lend
+
         max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
         if not (
             model.tail_writes_source_kv
@@ -161,6 +163,9 @@ class DecoderReplayTail:
             and max_rows > 0
             # Borrowed graph-pool storage forbids capturing mid-serving.
             and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
+            # KT_PREFILL_LEND points the layers' weights elsewhere on every
+            # prefill step; a graph would keep the addresses of its capture.
+            and not kt_lend.ENABLED
         ):
             return None
         from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW

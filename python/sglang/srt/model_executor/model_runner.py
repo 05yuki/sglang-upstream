@@ -1881,6 +1881,11 @@ class ModelRunner:
                 forward_batch,
             ) as recorder_outputs,
         ):
+            # patches/sglang-dsv41-kt-prefill-lend.py: weights out / scratch in
+            # for a streamed prefill, back before anything else
+            from sglang.srt.layers.moe import kt_lend
+
+            kt_lend.before_forward(forward_batch)
             output = self._forward_raw(forward_batch, pp_proxy_tensors)
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
