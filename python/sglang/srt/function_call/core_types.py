@@ -10,6 +10,8 @@ class ToolCallItem(BaseModel):
     tool_index: int
     name: Optional[str] = None
     parameters: str  # JSON string
+    # sglang-dsv41-encoding-namespace-turns.py: set by detectors whose format qualifies names
+    namespace: Optional[str] = None
 
 
 class StreamingParseResult(BaseModel):

@@ -116,19 +116,63 @@ def to_json(value: Any) -> str:
 
 
 def tools_from_openai_format(tools):
-    """Extract function definitions from OpenAI-format tool list."""
-    return [tool["function"] for tool in tools]
+    """Extract function definitions with namespace-qualified names."""
+    # sglang-dsv41-encoding-namespace-turns.py: reference dba1be0a40aa
+    functions = []
+    for tool in tools:
+        function = dict(tool["function"])
+        if tool.get("namespace") is not None:
+            function["namespace"] = tool["namespace"]
+        function["name"] = _tool_name_for_encoding(function)
+        namespace = function.pop("namespace", None)
+        if isinstance(namespace, dict) and namespace.get("description"):
+            function["description"] = (
+                namespace["description"] + "\n" + (function.get("description") or "")
+            )
+        functions.append(function)
+    return functions
+
+
+def _split_tool_name(
+    name: str, namespace: Optional[str] = None
+) -> Tuple[Optional[str], str]:
+    """Split a qualified name and validate any explicit namespace."""
+    prefix, separator, bare_name = name.partition("::")
+    if separator:
+        if namespace not in (None, prefix):
+            raise ValueError(f"Conflicting tool namespaces: {namespace} != {prefix}")
+        namespace, name = prefix, bare_name
+    if "::" in name:
+        raise ValueError(f"Tool name must not contain '::': {name}")
+    if namespace is not None and "::" in namespace:
+        raise ValueError(f"Tool namespace must not contain '::': {namespace}")
+    return namespace, name
+
+
+def _tool_name_for_encoding(tool: Dict[str, Any]) -> str:
+    """`namespace::name` for a function or call dict, the bare name without one."""
+    namespace = tool.get("namespace")
+    if isinstance(namespace, dict):
+        if not namespace.get("name"):
+            raise ValueError(f"Tool namespace object has no name: {namespace}")
+        namespace = namespace["name"]
+    namespace, name = _split_tool_name(tool["name"], namespace)
+    return name if namespace is None else f"{namespace}::{name}"
 
 
 def tool_calls_from_openai_format(tool_calls):
     """Convert OpenAI-format tool calls to internal format."""
-    return [
-        {
-            "name": tool_call["function"]["name"],
-            "arguments": tool_call["function"]["arguments"],
-        }
-        for tool_call in tool_calls
-    ]
+    calls = []
+    for tool_call in tool_calls:
+        function = tool_call["function"]
+        namespace, name = _split_tool_name(
+            function["name"], tool_call.get("namespace") or function.get("namespace")
+        )
+        call = {"name": name, "arguments": function["arguments"]}
+        if namespace is not None:
+            call["namespace"] = namespace
+        calls.append(call)
+    return calls
 
 
 def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
@@ -203,11 +247,18 @@ def render_reasoning_effort(
 def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
     """Mid-conversation system messages also count as user messages here;
     they trigger the assistant generation header.
+    User messages containing only tool results do not start a new turn.
     """
     last_user_index = -1
     for idx in range(len(messages) - 1, -1, -1):
         role = messages[idx].get("role")
         if role in ["user", "developer"] or (role == "system" and idx > 0):
+            content_blocks = messages[idx].get("content_blocks")
+            if content_blocks and not any(
+                block.get("type") in ("text", "image", "image_url")
+                for block in content_blocks
+            ):
+                continue
             last_user_index = idx
             break
     return last_user_index
@@ -343,7 +394,7 @@ def render_message(
                 tool_call_template.format(
                     dsml_token=dsml_token,
                     tool_call_tag_name=tool_call_tag_name,
-                    name=tc.get("name"),
+                    name=_tool_name_for_encoding(tc),
                     arguments=encode_arguments_to_dsml(tc),
                 )
                 for tc in tool_calls
@@ -443,10 +494,13 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         if role == "tool":
             # Convert tool message to a user message with tool_result block
+            content = msg.get("content", "")
+            if msg.get("content_blocks") and not isinstance(msg.get("content"), str):
+                content = msg["content_blocks"]
             tool_block = {
                 "type": "tool_result",
                 "tool_use_id": msg.get("tool_call_id", ""),
-                "content": msg.get("content", ""),
+                "content": content,
             }
             # Merge into previous message if it's already a user (merged tool)
             if (
@@ -465,7 +519,12 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif role == "user":
             content_blocks = msg.get("content_blocks")
             if content_blocks is None:
-                content_blocks = [{"type": "text", "text": msg.get("content", "")}]
+                content = msg.get("content", "")
+                content_blocks = (
+                    content
+                    if isinstance(content, list)
+                    else [{"type": "text", "text": content}]
+                )
             if (
                 merged
                 and merged[-1].get("role") == "user"
@@ -664,14 +723,6 @@ def _encode_messages_text(
 ) -> str:
     """Encode preprocessed (text-only) messages into the V4.1 prompt format."""
     context = context if context else []
-
-    # Preprocess: merge tool messages and sort tool results
-    messages = merge_tool_messages(messages)
-    messages = sort_tool_results_by_call_order(context + messages)[len(context) :]
-    if context:
-        context = merge_tool_messages(context)
-        context = sort_tool_results_by_call_order(context)
-
     full_messages = context + messages
 
     prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
@@ -718,7 +769,14 @@ def encode_messages(
     prompt string, or ``(prompt, {"images": [...]})`` when
     ``return_multi_modal_data`` is set; the image records are in prompt order.
     """
-    context = context or []
+    # Validate before merging can discard message-level textual fields.
+    for msg in (context or []) + messages:
+        _validate_no_image_sp_tokens(msg)
+
+    # Collect images only after tool results are in their final prompt order.
+    context = merge_tool_messages(context or [])
+    messages = merge_tool_messages(messages)
+    messages = sort_tool_results_by_call_order(context + messages)[len(context) :]
     processed_context, _ = process_image_messages(context) if context else ([], [])
     processed_messages, images = process_image_messages(messages)
     prompt = _encode_messages_text(

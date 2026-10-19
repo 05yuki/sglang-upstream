@@ -673,6 +673,15 @@ class FunctionResponse(BaseModel):
 
     name: Optional[str] = None
     arguments: Optional[str | Dict[str, Any]] = None
+    # sglang-dsv41-encoding-namespace-turns.py: accepted in history (DeepSeek-V4.1)
+    namespace: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.namespace is None:
+            data.pop("namespace", None)
+        return data
 
 
 class ToolCall(BaseModel):
@@ -682,6 +691,16 @@ class ToolCall(BaseModel):
     index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
+    # sglang-dsv41-encoding-namespace-turns.py: the call's tool namespace, an
+    # extension to the OpenAI shape; serialized only when set.
+    namespace: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.namespace is None:
+            data.pop("namespace", None)
+        return data
 
 
 _GenericMessageRole = Literal[
@@ -751,12 +770,16 @@ class Function(BaseModel):
     parameters: Optional[object] = None
     strict: bool = False
     defer_loading: Optional[bool] = None
+    # sglang-dsv41-encoding-namespace-turns.py: a string or {"name", "description"}
+    namespace: Optional[Union[str, Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.defer_loading is None:
             data.pop("defer_loading", None)
+        if self.namespace is None:
+            data.pop("namespace", None)
         return data
 
 
@@ -766,6 +789,15 @@ class Tool(BaseModel):
     type: str = Field(default="function", examples=["function"])
     function: Function
     defer_loading: Optional[bool] = None
+    # sglang-dsv41-encoding-namespace-turns.py: a string or {"name", "description"}
+    namespace: Optional[Union[str, Dict[str, Any]]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.namespace is None:
+            data.pop("namespace", None)
+        return data
 
     @model_validator(mode="after")
     def _propagate_defer_loading(self) -> Tool:
