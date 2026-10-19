@@ -1143,6 +1143,76 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+_KT_SKIP_CPU_EXPERTS = os.environ.get("KT_LOAD_SKIP_CPU_EXPERTS", "1") == "1"
+_KT_SKIP_CPU_EXPERTS_RE = re.compile(
+    os.environ.get(
+        "KT_LOAD_SKIP_CPU_EXPERTS_RE", r"(?:^|\.)layers\.(\d+)\..*\.experts\.(\d+)\."
+    )
+)
+_kt_skip_state = {}
+
+
+def _kt_cpu_expert_key(name: str) -> bool:
+    """True for a checkpoint key the MoE weight_loader would drop unread: a routed
+    expert whose every physical slot is a KT CPU expert (same test as
+    fused_moe_triton/layer.py `_is_kt_cpu_expert`, asked before the read)."""
+    if not _KT_SKIP_CPU_EXPERTS:
+        return False
+    m = _KT_SKIP_CPU_EXPERTS_RE.search(name)
+    if m is None:
+        return False
+    st = _kt_skip_state
+    if "n" not in st:
+        # The loader's threads ask at once. Work in locals and publish "n" last:
+        # a thread that finds "n" finds the final count and "meta" with it.
+        try:
+            from sglang.srt.runtime_context import get_exec
+
+            moe = get_exec().moe
+            n = int(moe.kt_num_gpu_experts) if moe.kt_weight_path is not None else -1
+            # kt_kv_hot_lend: the experts the hot lend's shadows hold are read too
+            try:
+                from sglang.srt.layers.moe import kt_kv_hot_lend
+
+                n = kt_kv_hot_lend.load_count(n)
+            except ImportError:
+                pass
+        except Exception:
+            n = -1
+        try:
+            from sglang.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+
+            meta = get_global_expert_location_metadata()
+        except Exception:
+            meta = None
+        st.setdefault("skipped", 0)
+        st["meta"] = meta
+        st["n"] = n
+    n = st["n"]
+    if n < 0:
+        return False
+    layer, eid = int(m.group(1)), int(m.group(2))
+    meta = st["meta"]
+    if meta is not None:
+        try:
+            phys = meta.logical_to_all_physical(layer, eid)
+        except Exception:
+            phys = [eid]
+    else:
+        phys = [eid]
+    if any(p < n for p in phys):
+        return False
+    st["skipped"] += 1
+    if st["skipped"] % 50000 == 0:
+        print(
+            f"[kt-load] {st['skipped']} CPU-expert tensors skipped unread (GPU experts per layer: {n})",
+            flush=True,
+        )
+    return True
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
@@ -1323,6 +1393,81 @@ def fastsafetensors_weights_iterator(
                 _drop_file_cache_after_load(loaded_file)
 
 
+_DENSE_PREFETCH_THREADS = int(os.environ.get("KT_LOAD_PREFETCH", "0") or 0)
+_DENSE_PREFETCH_PIECE = int(os.environ.get("KT_LOAD_PREFETCH_PIECE_MB", "16")) << 20
+_DENSE_PREFETCH_SKIP = re.compile(
+    os.environ.get("KT_LOAD_PREFETCH_SKIP", r"\.experts\.|\.engram\.embed\.")
+)
+
+
+def _prefetch_dense_tensors(st_file: str) -> None:
+    """KT_LOAD_PREFETCH=<threads>: pread this shard's tensors whose names do
+    not contain KT_LOAD_PREFETCH_SKIP (default `.mlp.experts.`) in 16 MiB
+    pieces on a thread pool, so the weight loaders' mmap faults find the
+    pages in the cache instead of reading one readahead window at a time."""
+    if _DENSE_PREFETCH_THREADS <= 0:
+        return
+    import time
+
+    t0 = time.time()
+    with open(st_file, "rb") as fh:
+        n = struct.unpack("<Q", fh.read(8))[0]
+        meta = json.loads(fh.read(n))
+    ranges = []
+    for k, v in meta.items():
+        if k == "__metadata__" or _DENSE_PREFETCH_SKIP.search(k):
+            continue
+        b, e = v["data_offsets"]
+        ranges.append((8 + n + b, e - b))
+    if not ranges:
+        return
+    ranges.sort()
+    merged = []
+    cur_off, cur_end = ranges[0][0], ranges[0][0] + ranges[0][1]
+    for off, sz in ranges[1:]:
+        if off <= cur_end + (1 << 20):
+            cur_end = max(cur_end, off + sz)
+        else:
+            merged.append((cur_off, cur_end))
+            cur_off, cur_end = off, off + sz
+    merged.append((cur_off, cur_end))
+    pieces = []
+    for a, b in merged:
+        p = a
+        while p < b:
+            pieces.append((p, min(_DENSE_PREFETCH_PIECE, b - p)))
+            p += _DENSE_PREFETCH_PIECE
+    local = threading.local()
+    fd = os.open(st_file, os.O_RDONLY)
+
+    def read(piece):
+        off, sz = piece
+        buf = getattr(local, "buf", None)
+        if buf is None or len(buf) < sz:
+            buf = local.buf = bytearray(max(sz, _DENSE_PREFETCH_PIECE))
+        mv = memoryview(buf)[:sz]
+        got = 0
+        while got < sz:
+            r = os.preadv(fd, [mv[got:]], off + got)
+            if r <= 0:
+                break
+            got += r
+        return got
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(_DENSE_PREFETCH_THREADS) as ex:
+            done = sum(ex.map(read, pieces))
+    finally:
+        os.close(fd)
+    logger.info(
+        "[dense prefetch] %s: %.2f GiB in %.2f s (%d tensors)",
+        os.path.basename(st_file),
+        done / 2**30,
+        time.time() - t0,
+        len(ranges),
+    )
+
+
 def buffered_multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
@@ -1351,8 +1496,11 @@ def buffered_multi_thread_safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
         else:
+            _prefetch_dense_tensors(st_file)
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {
+                    k: f.get_tensor(k) for k in f.keys() if not _kt_cpu_expert_key(k)
+                }
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.
