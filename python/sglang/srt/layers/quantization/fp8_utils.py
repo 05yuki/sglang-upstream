@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import logging
 from enum import Enum
 from functools import lru_cache, partial
@@ -839,6 +840,8 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
                 "--fp8-gemm-backend=cutlass is deprecated on this hardware. "
                 "Please switch to DeepGEMM or FlashInfer TRTLLM on SM90/SM100."
             )
+        if os.environ.get("SGLANG_FP8_DECODE_SPLITK") == "1":
+            return cutlass_w8a8_block_fp8_linear_splitk_decode
         return cutlass_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_aiter():
@@ -880,6 +883,8 @@ def _dispatch_auto_backend() -> Callable:
     elif get_platform().is_blackwell and is_flashinfer_available():
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
     elif get_platform().is_sm120:
+        if os.environ.get("SGLANG_FP8_DECODE_SPLITK") == "1":
+            return cutlass_w8a8_block_fp8_linear_splitk_decode
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
@@ -1112,6 +1117,62 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
+
+
+from sglang.kernels.ops.quantization.fp8_kernel import (  # noqa: E402
+    _run_per_token_group_quant_8bit_kernel,
+    fp8_max as _FP8_MAX,
+    fp8_min as _FP8_MIN,
+)
+
+
+def cutlass_w8a8_block_fp8_linear_splitk_decode(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """cutlass for prefill; decode rows (<= 16) through the Triton split-K
+    block-FP8 matmul, fed the operands cutlass would have been fed
+    (patches/sglang-fp8-decode-splitk.py)."""
+    rows = input.numel() // input.shape[-1]
+    if rows > 16 or weight.shape[0] % 128 != 0 or weight.shape[1] % 128 != 0:
+        return cutlass_w8a8_block_fp8_linear_with_fallback(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+    if input_scale is not None:
+        # Pre-quantized (SGLANG_OPT_MOE_QUANT_ONCE): keep the padded row count,
+        # as the cutlass branch does; the caller slices.
+        q_input = input.view(-1, input.shape[-1])
+        output = w8a8_block_fp8_matmul_triton(
+            q_input, weight, input_scale, weight_scale, block_size,
+            output_dtype=torch.bfloat16,
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*input.shape[:-1], weight.shape[0])
+    input_2d = input.view(-1, input.shape[-1])
+    # The quant kernel sglang_per_token_group_quant_fp8_row_padded runs, with its
+    # arguments, into unpadded buffers: the same FP8 values and scales, without
+    # the two zero-fills of pad rows per GEMM that only cutlass needs (they were
+    # 486 of ~3,700 kernel launches a decode token, 09-23).
+    m, k = input_2d.shape
+    q_input = torch.empty((m, k), device=input_2d.device, dtype=torch.float8_e4m3fn)
+    x_scale = torch.empty(
+        (k // block_size[1], m), device=input_2d.device, dtype=torch.float32
+    ).transpose(0, 1)
+    _run_per_token_group_quant_8bit_kernel(
+        input_2d, q_input, x_scale, block_size[1], 1e-10, _FP8_MIN, _FP8_MAX,
+        scale_ue8m0=False, fuse_silu_and_mul=False, masked_m=None,
+    )
+    output = w8a8_block_fp8_matmul_triton(
+        q_input, weight, x_scale, weight_scale, block_size, output_dtype=input_2d.dtype
+    )
+    if bias is not None:
+        output += bias
+    return output.to(dtype=input_2d.dtype).view(*input.shape[:-1], weight.shape[0])
 
 
 def deepgemm_w8a8_block_fp8_linear_with_fallback(

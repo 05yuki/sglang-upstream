@@ -48,6 +48,7 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
 _is_gfx1250 = is_gfx1250_supported()
+_FP8_GEMV = os.environ.get("SGLANG_FP8_GEMV", "1") == "1"
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -1661,6 +1662,9 @@ def w8a8_mxfp8_matmul_deepgemm(
     return C
 
 
+_skinny_seen = set()
+
+
 def w8a8_block_fp8_matmul_triton(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1690,6 +1694,23 @@ def w8a8_block_fp8_matmul_triton(
 
     block_n, block_k = block_size
 
+    # sglang-fp8-block-gemv.py: decode-sized calls step K by several scale groups
+    # (the block kernel steps by one, 32 on V4.1-1017); SGLANG_FP8_GEMV=0 turns it off
+    if (
+        M <= 4
+        and _FP8_GEMV
+        and not _is_hip
+        and not _is_gfx1250
+        and As.dtype == torch.float
+        and Bs.dtype == torch.float
+    ):
+        from sglang.kernels.ops.quantization.fp8_block_gemv import fp8_block_gemv
+
+        fp8_block_gemv(
+            A.view(M, K), B, As.reshape(M, -1), Bs, block_size, C.view(M, N)
+        )
+        return C
+
     configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
     if configs:
         # If an optimal configuration map has been found, look up the
@@ -1707,13 +1728,44 @@ def w8a8_block_fp8_matmul_triton(
             "num_stages": 3,
         }
 
+    # Skinny GEMMs (decode: M is the batch, 1 here) with the default tiling
+    # launch only N/128 CTAs, each streaming a K x 128 strip alone: on the
+    # RTX 5070 Ti (no tuned config) that is 250-500 GB/s against ~900 and the
+    # dense projections were 38 of the 70 ms of a V4.1 decode step (09-13).
+    # For M <= 16 use the split-K kernel with a 16-row tile: measured 3-6x
+    # faster on N=2048..7168 and ~1.2x on N=16384+. SGLANG_FP8_SKINNY=0 turns
+    # it off; SGLANG_FP8_SKINNY_SPLIT_K / _BLOCK_N override the tile.
+    skinny = (
+        not configs
+        and M <= 16
+        and not _is_hip
+        and not _is_gfx1250
+        and os.environ.get("SGLANG_FP8_SKINNY", "1") == "1"
+    )
+    if skinny:
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": int(os.environ.get("SGLANG_FP8_SKINNY_BLOCK_N", "128")),
+            "BLOCK_SIZE_K": block_size[1],
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+            "SWAP_AB": False,
+            "SPLIT_K": int(os.environ.get("SGLANG_FP8_SKINNY_SPLIT_K", "4")),
+        }
+        if os.environ.get("SGLANG_FP8_SKINNY_LOG") == "1":
+            key = (M, N, K)
+            if key not in _skinny_seen:
+                _skinny_seen.add(key)
+                logger.info("fp8 skinny gemm shape M=%d N=%d K=%d", M, N, K)
+
     if _is_gfx1250:
         config = {**config, "num_stages": 1}
         kernel = _w8a8_block_fp8_matmul_gfx1250
     else:
         kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
 
-    hopper_tuned = get_platform().is_sm90 and (
+    hopper_tuned = (get_platform().is_sm90 or skinny) and (
         config.get("SWAP_AB", False) or config.get("SPLIT_K", 1) > 1
     )
     if hopper_tuned:
