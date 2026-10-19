@@ -453,6 +453,65 @@ if _is_hip:
             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
 
 
+from sglang.srt.models.deepseek_common.wo_a_fp8_gemv import (  # noqa: E402
+    fp8_blocks_from_bf16,
+    wo_a_fp8_dequant,
+    wo_a_fp8_gemv,
+)
+
+
+def _build_wo_a_fp8_copies(model) -> None:
+    """SGLANG_DSV4_WO_A_FP8_GEMV=1: give each bf16 wo_a an exact FP8 copy for
+    single-token decode (patches/sglang-dsv4-wo-a-fp8-gemv.py)."""
+    import os
+
+    if os.environ.get("SGLANG_DSV4_WO_A_FP8_GEMV") != "1":
+        return
+    built = skipped = 0
+    for module in model.modules():
+        if getattr(module, "wo_a_fp8", True) or not hasattr(module, "o_lora_rank"):
+            continue
+        weight = getattr(getattr(module, "wo_a", None), "weight", None)
+        if weight is None or weight.dtype != torch.bfloat16:
+            continue
+        w = weight.data.view(module.n_local_groups, module.o_lora_rank, -1)
+        copy = fp8_blocks_from_bf16(w)
+        if copy is None:
+            skipped += 1
+            continue
+        module._wo_a_fp8_copy = copy
+        built += 1
+    logger.info(
+        "wo_a FP8 decode copies: %d built, %d left on bf16 (not an exact FP8 image)",
+        built,
+        skipped,
+    )
+    # SGLANG_DSV4_WO_A_FP8_ONLY=1 (sglang-dsv4-wo-a-fp8-block.py): the attention layers
+    # drop the bf16 wo_a; other forwards dequantize into one shared scratch
+    if os.environ.get("SGLANG_DSV4_WO_A_FP8_ONLY") != "1" or not built:
+        return
+    scratch = {}
+    freed = 0
+    for module in model.modules():
+        copy = getattr(module, "_wo_a_fp8_copy", None)
+        if copy is None or type(module).__name__ != "MQALayer":
+            continue
+        weight = module.wo_a.weight
+        key = (weight.device, tuple(copy[0].shape))
+        if key not in scratch:
+            scratch[key] = torch.empty(copy[0].shape, dtype=torch.bfloat16, device=weight.device)
+        module._wo_a_fp8_scratch = scratch[key]
+        freed += weight.numel() * weight.element_size()
+        weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
+        module._wo_a_fp8_only = True
+    torch.cuda.empty_cache()
+    logger.info(
+        "wo_a FP8 only: %.1f MB of bf16 freed, %.1f MB of scratch",
+        freed / 2**20,
+        sum(t.numel() * t.element_size() for t in scratch.values()) / 2**20,
+    )
+
+
 def _o_fp8_qdq_block() -> int:
     """SGLANG_DSV4_O_FP8_QDQ_BLOCK (sglang-dsv4-o-fp8-qdq.py): FP8 quant-dequant of the
     attention output before a bf16 wo_a, in blocks of this many; 0 = off."""
@@ -462,6 +521,48 @@ def _o_fp8_qdq_block() -> int:
 
 
 _O_FP8_QDQ_BLOCK = _o_fp8_qdq_block()
+
+
+# sglang-dsv4-wo-a-fp8-native.py
+_WO_A_FP8_NATIVE = __import__("os").environ.get("SGLANG_DSV4_WO_A_FP8_NATIVE", "0") == "1"
+
+
+class _WoANativeKeep:
+    """wo_a's quant method under SGLANG_DSV4_WO_A_FP8_NATIVE: nothing after loading."""
+
+    def process_weights_after_loading(self, layer) -> None:
+        return None
+
+
+def _setup_wo_a_native(model) -> None:
+    """After loading: each native-FP8 wo_a's scales as fp32 [G, R/b, D/b] (powers of
+    two, exact), and one bf16 scratch per device for the forwards that dequantize."""
+    scratch, n = {}, 0
+    for module in model.modules():
+        if not getattr(module, "_wo_a_native_fp8", False):
+            continue
+        w, sc = module.wo_a.weight, module.wo_a.weight_scale_inv
+        G, R = module.n_local_groups, module.o_lora_rank
+        D = w.shape[-1]
+        if w.dtype != torch.float8_e4m3fn or w.shape[0] != G * R or sc.dim() != 2:
+            raise RuntimeError(f"SGLANG_DSV4_WO_A_FP8_NATIVE: wo_a {tuple(w.shape)} {w.dtype}, "
+                               f"scales {tuple(sc.shape)} {sc.dtype}: not the checkpoint's FP8 blocks")
+        b, bk = (G * R) // sc.shape[0], D // sc.shape[1]
+        if b != bk or R % b or b * sc.shape[0] != G * R:
+            raise RuntimeError(f"SGLANG_DSV4_WO_A_FP8_NATIVE: {b} x {bk} blocks over [{G * R}, {D}]")
+        if sc.dtype in (torch.uint8, torch.float8_e8m0fnu):  # E8M0 exponents
+            scf = torch.exp2(sc.view(torch.uint8).float() - 127)
+        else:
+            scf = sc.float()
+        module._wo_a_native_s = scf.reshape(G, R // b, D // b).contiguous()
+        key = (w.device, G, R, D)
+        if key not in scratch:
+            scratch[key] = torch.empty((G, R, D), dtype=torch.bfloat16, device=w.device)
+        module._wo_a_fp8_scratch = scratch[key]
+        n += 1
+    if n:
+        logger.info("wo_a in the checkpoint's FP8: %d layers, %.1f MB of scratch", n,
+                    sum(t.numel() * 2 for t in scratch.values()) / 2**20)
 
 
 def _apply_wo_a_bf16_matmul(
@@ -806,6 +907,17 @@ class MqaAttentionBase(nn.Module):
         else:
             wo_a_quant_config = None
 
+        # sglang-dsv4-wo-a-fp8-native.py: the checkpoint's FP8 wo_a kept as it is
+        self._wo_a_native_fp8 = (
+            _WO_A_FP8_NATIVE
+            and not fp8
+            and wo_a_fp8 is None
+            and wo_a_keeps_quant_config is None
+            and isinstance(quant_config, Fp8Config)
+            and quant_config.weight_block_size is not None
+        )
+        if self._wo_a_native_fp8:
+            wo_a_quant_config = quant_config
         self.fuse_wqa_wkv = fuse
         self.wo_a_fp8 = fp8
 
@@ -853,8 +965,13 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_a", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            **({} if fp8 else {"params_dtype": torch.bfloat16}),
+            **({} if fp8 or self._wo_a_native_fp8 else {"params_dtype": torch.bfloat16}),
         )
+        if self._wo_a_native_fp8:
+            # applied by forward() below, never through the linear method: keep the
+            # weight and its scales as loaded (no requantization, no relayout)
+            self.wo_a.skip_aiter_bpreshuffle = True
+            self.wo_a.quant_method = _WoANativeKeep()
         if fp8:
             from sglang.srt.layers import deep_gemm_wrapper
 
@@ -2077,7 +2194,31 @@ class MQALayer(MqaAttentionBase):
 
                     o = o_fp8_qdq_(o, _O_FP8_QDQ_BLOCK)
                 wo_a_weight = getattr(self.wo_a, "weight", None)
-                if wo_a_weight is not None:
+                wo_a_fp8_copy = getattr(self, "_wo_a_fp8_copy", None)
+                if (
+                    wo_a_fp8_copy is not None
+                    and o.shape[0] == 1
+                    and forward_batch.forward_mode.is_decode()
+                ):
+                    o = wo_a_fp8_gemv(o, *wo_a_fp8_copy)
+                elif getattr(self, "_wo_a_fp8_only", False):
+                    # sglang-dsv4-wo-a-fp8-block.py: the bf16 wo_a is gone
+                    wo_a = wo_a_fp8_dequant(*wo_a_fp8_copy, self._wo_a_fp8_scratch)
+                    o = _apply_wo_a_bf16_matmul(
+                        o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+                    )
+                elif getattr(self, "_wo_a_native_s", None) is not None:
+                    # sglang-dsv4-wo-a-fp8-native.py (the weight is viewed here, every
+                    # call: the prefill lend points it elsewhere while it streams)
+                    q = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                    if o.shape[0] == 1 and forward_batch.forward_mode.is_decode():
+                        o = wo_a_fp8_gemv(o, q, self._wo_a_native_s)
+                    else:
+                        wo_a = wo_a_fp8_dequant(q, self._wo_a_native_s, self._wo_a_fp8_scratch)
+                        o = _apply_wo_a_bf16_matmul(
+                            o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+                        )
+                elif wo_a_weight is not None:
                     wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
                     o = _apply_wo_a_bf16_matmul(
                         o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
@@ -4422,6 +4563,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
+        if not is_nextn:
+            _build_wo_a_fp8_copies(self)
+            _setup_wo_a_native(self)
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
 
@@ -5104,6 +5248,9 @@ def _prepare_deepseek_v4_weights(
 
     if quant_config is not None and quant_config.get_name() == "expert_pack":
         logger.info("Keep Expert Pack GGUF weights on the streaming load path")
+        return weights
+    if _WO_A_FP8_NATIVE and isinstance(quant_config, Fp8Config):
+        # sglang-dsv4-wo-a-fp8-native.py: wo_a loads as the checkpoint has it
         return weights
     return _dequant_fp8_wo_a_streaming(weights)
 
