@@ -5529,6 +5529,11 @@ class Scheduler(
 
 
 def dispatch_event_loop(scheduler: Scheduler):
+    if os.environ.get("KT_PREFILL_LEND_PROBE"):
+        # patches/sglang-kt-lend-probe.py: measure the lend before serving
+        from sglang.srt.layers.moe import kt_lend_probe
+
+        kt_lend_probe.run(scheduler)
     # The live PP property asserts before torch.distributed init (MLX stub).
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:

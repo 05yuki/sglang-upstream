@@ -294,7 +294,12 @@ def _initialize_model(
     if load_config.draft_model_idx is not None:
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
-    return model_class(**kwargs)
+    model = model_class(**kwargs)
+    # patches/sglang-dsv41-kt-prefill-lend.py: before any weight loads
+    from sglang.srt.layers.moe import kt_lend
+
+    kt_lend.bind_model(model)
+    return model
 
 
 def _post_load_weights(model: nn.Module) -> None:
@@ -1026,6 +1031,14 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+                from sglang.srt.layers.moe import kt_lend
+
+                kt_lend.after_module(module)
+
+        # patches/sglang-dsv41-kt-prefill-lend.py: before the KV pool is sized
+        from sglang.srt.layers.moe import kt_lend
+
+        kt_lend.after_load()
 
 
 class LayeredModelLoader(DefaultModelLoader):

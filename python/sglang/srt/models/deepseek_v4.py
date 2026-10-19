@@ -2100,7 +2100,11 @@ class MQALayer(MqaAttentionBase):
                     or tuple(q_padded.shape) != want
                     or q_padded.dtype != x.dtype
                 ):
-                    q_padded = x.new_zeros(*want)
+                    # sglang-dsv4-qpad-scratch.py: a prefill window's goes with the scratch
+                    from sglang.srt.layers.moe import kt_lend
+
+                    with kt_lend.scratch_region():
+                        q_padded = x.new_zeros(*want)
                     if meta is not None:
                         try:
                             meta.q_pad_buffer = q_padded
