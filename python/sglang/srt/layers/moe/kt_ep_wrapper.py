@@ -151,7 +151,36 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
     return topk_ids
 
 
+_routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
 _gpu_mask_zero = os.environ.get("KT_GPU_MASK_ZERO") == "1"
+_routing_state = {}
+
+
+def _routing_count(device, layer_idx, topk_ids, rank):
+    import threading
+    import time
+
+    st = _routing_state.get(device.index)
+    if st is None:
+        counts = torch.zeros((64, 512), dtype=torch.int32, device=device)
+        ones = torch.ones((1,), dtype=torch.int32, device=device)
+        st = _routing_state[device.index] = {"counts": counts, "ones": ones}
+
+        def dump():
+            while True:
+                time.sleep(30)
+                try:
+                    c = st["counts"].cpu()
+                    torch.save(
+                        {"rank": rank, "logical_count": c},
+                        f"{_routing_dump_prefix}-rank{rank}.pt",
+                    )
+                except Exception as e:  # never take the scheduler down for a dump
+                    print(f"[kt-routing] dump failed: {e}", flush=True)
+
+        threading.Thread(target=dump, daemon=True, name="kt-routing-dump").start()
+    ids = topk_ids.reshape(-1).to(torch.int64)
+    st["counts"][layer_idx].index_add_(0, ids, st["ones"].expand(ids.numel()))
 
 
 def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
@@ -383,6 +412,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # attributes, not unpacking: the packed variant carries a fourth field
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
+        # KT_ROUTING_DUMP=<prefix>: accumulate a [layers, experts] histogram of
+        # the routed expert ids on the GPU (a captured index_add_, so it keeps
+        # counting under CUDA graph replay) and save it as
+        # <prefix>-rank<r>.pt every 30 s. SGLang's expert distribution recorder
+        # never sees the V4 router's ids (09-13); this does.
         # Submit forward task to CPU (non-blocking)
         self.wrapper.submit_forward(
             x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
@@ -436,6 +470,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        # The ids are physical: --init-expert-location moves experts between the GPU
+        # slots (physical 0..num_gpu_experts-1) and the CPU, and TopK resolves the
+        # placement for every router (resolve_routing_inputs).
+        # KT_ROUTING_DUMP=<prefix>: a [layers, experts] histogram of the routed physical ids
+        # (a captured index_add_, so it keeps counting under CUDA graph replay), saved as
+        # <prefix>-rank<r>.pt every 30 s. Counted here, before the hot lend and the
+        # streamer split the routes (sglang-kt-routing-count-before-split.py); SGLang's
+        # expert distribution recorder never sees the V4 router's ids (09-13).
+        if _routing_dump_prefix and self.tp_rank == 0:
+            _routing_count(x.device, self.kt_config.layer_idx, topk_output.topk_ids, self.tp_rank)
+
 
         # Step 1: Submit CPU expert computation (non-blocking)
         if self.tp_rank == 0:
