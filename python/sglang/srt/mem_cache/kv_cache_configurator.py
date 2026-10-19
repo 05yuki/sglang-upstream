@@ -324,7 +324,11 @@ class KVCacheConfigurator:
             )
             config = self.memory_pool_config
         else:
-            config = self._resolve_memory_pool_config(pre_model_load_memory)
+            # KT_PREFILL_SWA_LEND (sglang-kt-kv-vmm.py): budgeted at the lend's own chunk
+            from sglang.srt.layers.moe import kt_kv_prefill_lend
+
+            with kt_kv_prefill_lend.swa_sizing():
+                config = self._resolve_memory_pool_config(pre_model_load_memory)
 
         sizes = self._derive_pool_sizes(config=config)
 
@@ -333,6 +337,10 @@ class KVCacheConfigurator:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
+        if self.is_hybrid_swa and not self.is_draft_worker:
+            from sglang.srt.layers.moe import kt_kv_prefill_lend
+
+            kt_kv_prefill_lend.swa_init(pools.token_to_kv_pool_allocator, pools.token_to_kv_pool)
 
         logger.info(
             f"Memory pool end. "
@@ -402,6 +410,15 @@ class KVCacheConfigurator:
         c128_state_dtype: Optional[torch.dtype] = None
         if is_deepseek_v4(self.model_config.hf_config):
             c4_state_dtype, c128_state_dtype = _get_dsv4_compress_state_dtypes()
+
+        if swa_max_total_num_tokens is not None and not self.is_draft_worker:
+            # KT_PREFILL_SWA_LEND (sglang-kt-kv-vmm.py): the sliding-window pool holds
+            # the largest planned chunk, its free pages leave outside prefill
+            from sglang.srt.layers.moe import kt_kv_prefill_lend
+
+            swa_max_total_num_tokens, c4_state_pool_size = kt_kv_prefill_lend.swa_size(
+                swa_max_total_num_tokens, self.pool_page_size, c4_state_pool_size
+            )
 
         return _PoolSizes(
             max_total_num_tokens=max_total_num_tokens,
