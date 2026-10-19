@@ -3430,6 +3430,10 @@ class Scheduler(
             req.storage_prefetch_retry_attempts = 0
             req.storage_prefetch_last_match_len = None
             req.staged_prefetch_plan = None
+        # the prompt length for the prefill's loan of free KV pages
+        from sglang.srt.layers.moe import kt_kv_prefill_lend
+
+        kt_kv_prefill_lend.note_request(req.rid, len(req.origin_input_ids))
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 self._release_aborted_request(req)
@@ -4090,6 +4094,11 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        # the chunk planned per request from the room a prefill has, the free KV
+        # pages included (sglang-kt-kv-vmm.py, KT_PREFILL_PLAN)
+        from sglang.srt.layers.moe import kt_prefill_plan
+
+        chunked_prefill_size = kt_prefill_plan.chunk_for(self, chunked_prefill_size)
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic

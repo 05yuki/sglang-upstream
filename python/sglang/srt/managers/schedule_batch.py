@@ -4110,11 +4110,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         if req.extend_batch_idx < 2:
                             continue
                         else:
-                            pre_len = (
-                                pre_len - get_schedule().chunked_prefill_size
-                                if get_schedule().chunked_prefill_size > 0
-                                else pre_len
+                            # the chunk in flight is the one planned for this request
+                            # (sglang-kt-kv-vmm.py, kt_prefill_plan), not the launch chunk
+                            from sglang.srt.layers.moe import kt_prefill_plan
+
+                            _in_flight = kt_prefill_plan.chunk_in_flight(
+                                req, get_schedule().chunked_prefill_size
                             )
+                            pre_len = pre_len - _in_flight if _in_flight > 0 else pre_len
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)
