@@ -113,6 +113,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
         clamp_limit = (
             gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
         )
+        # The scalar as well: with zero resident experts the tensor is empty
+        # and the streamed prefill (kt_stream_prefill.py) needs the value.
+        self._swiglu_limit_value = None if clamp_limit is None else float(clamp_limit)
         if clamp_limit is not None:
             self._swiglu_limit_tensor = torch.full(
                 (E,), float(clamp_limit), dtype=torch.float32, device=device
@@ -125,6 +128,44 @@ class Mxfp4FlashinferCutlassMoEMethod:
         import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
         self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
+
+        # Preallocate the process-wide CUTLASS workspace here, before the
+        # decode CUDA graphs are captured: FlashInfer otherwise allocates it
+        # inside the capture, and with expandable_segments that scratch ended
+        # up aliasing live memory after long prefills (garbage from the SWA
+        # window onward, 09-13). Sized for the prefill chunk on this rank's
+        # expert count; a caller needing more (the KT streamed prefill's
+        # larger groups) grows it outside capture and the old one is retired,
+        # never freed.
+        if self._use_mxfp8_act_scaling:
+            from flashinfer.fused_moe.core import ActivationType
+            import os
+
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                mxfp4_workspace_nbytes,
+                preallocate_shared_cutlass_workspace,
+            )
+
+            w2 = layer.w2_weight
+            # The KT streamed prefill runs groups of KT_GPU_STREAM_GROUP experts
+            # through the same workspace.
+            experts = max(w2.shape[0], int(os.environ.get("KT_GPU_STREAM_GROUP", "0") or 0))
+            nbytes = mxfp4_workspace_nbytes(
+                1, w2.shape[1], w2.shape[2] * 2, experts * layer.moe_ep_size, layer.top_k,
+                torch.float8_e4m3fn,
+                ActivationType.SwigluStep if self._use_swiglu_step else ActivationType.Swiglu,
+                layer.moe_tp_size, layer.moe_tp_rank, layer.moe_ep_size, layer.moe_ep_rank,
+                True, device)
+            if os.environ.get("KT_GPU_STREAM_W16") == "1":
+                # The streamer's bf16 mode runs the same groups through the
+                # bf16 CUTLASS MoE, whose workspace is sized differently.
+                nbytes = max(nbytes, mxfp4_workspace_nbytes(
+                    1, w2.shape[1], w2.shape[2] * 2, experts * layer.moe_ep_size, layer.top_k,
+                    torch.bfloat16,
+                    ActivationType.SwigluStep if self._use_swiglu_step else ActivationType.Swiglu,
+                    layer.moe_tp_size, layer.moe_tp_rank, layer.moe_ep_size, layer.moe_ep_rank,
+                    False, device, weight_dtype=torch.bfloat16))
+            preallocate_shared_cutlass_workspace(nbytes, device)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # Preserve the base FP4 post-load handling.
