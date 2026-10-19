@@ -91,6 +91,14 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
 
     @contextmanager
     def region(self, tag: str, enable_cpu_backup: bool = False):
+        # KT_KV_VMM=1 (sglang-kt-kv-vmm.py): the KV pool on remappable memory
+        if tag == "kv_cache":
+            from sglang.srt.layers.moe import kt_kv_vmm
+
+            if kt_kv_vmm.ENABLED:
+                with kt_kv_vmm.region():
+                    yield
+                return
         yield
 
     @contextmanager
