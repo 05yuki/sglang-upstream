@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
@@ -3775,6 +3776,26 @@ class DeepseekV4Model(nn.Module):
                 self.engram_layout,
                 image_token_id=_engram_image_token_id(config),
             )
+        # Decode: the engram row lookups of the rank-local (not shared) tables
+        # start with the token on a side stream instead of at their layers.
+        self.engram_rows_stream = None
+        if (
+            _is_cuda
+            and os.environ.get("SGLANG_DSV41_ENGRAM_PREFETCH_ROWS", "1") == "1"
+            and self.pp_group.world_size == 1
+            and not is_dp_attention_enabled()
+            and any(
+                self.layers[i].engram is not None
+                and not self.layers[i].engram.embed._shared
+                for i in range(self.start_layer, self.end_layer)
+            )
+        ):
+            self.engram_rows_stream = torch.cuda.Stream()
+            logger.info("Engram row lookups start with the token in decode")
+        self.engram_rows_prefill = (
+            self.engram_rows_stream is not None
+            and os.environ.get("SGLANG_DSV41_ENGRAM_PREFETCH_PREFILL", "1") == "1"
+        )
 
         if not _is_cuda:
             self.use_fused_mhc_post_pre = (
@@ -3931,6 +3952,37 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
+        # {layer: (rows, event)}: this rank's rows, looked up on the side stream
+        prefetched_rows = {}
+        mode = forward_batch.forward_mode
+        if (
+            self.engram_rows_stream is not None
+            and hash_ids is not None
+            and hash_ids.shape[0] > 0
+            and (
+                mode.is_decode()
+                # a prefill chunk's later engram layers read their rows while the
+                # layers before them run
+                or (
+                    self.engram_rows_prefill
+                    and mode.is_extend_without_speculative()
+                    and not cp_extend
+                    and not is_in_breakable_cuda_graph()
+                )
+            )
+        ):
+            rows_stream = self.engram_rows_stream
+            rows_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(rows_stream):
+                for j in range(self.start_layer, self.end_layer):
+                    eng = self.layers[j].engram
+                    if eng is None or eng.embed._shared:
+                        continue
+                    rows = eng.embed._owned_rows(hash_ids[:, eng.layer_hash_index])
+                    ev = torch.cuda.Event()
+                    ev.record(rows_stream)
+                    prefetched_rows[j] = (rows, ev)
+            hash_ids.record_stream(rows_stream)
         tail = None
         if (
             self.late_layer_start is not None
@@ -4107,13 +4159,22 @@ class DeepseekV4Model(nn.Module):
             if engram is not None:
                 # No local name holds the pre-Engram residual: it would stay alive
                 # until the next Engram layer.
-                hidden_states = engram(
-                    state.residual,
-                    hash_ids[:, engram.layer_hash_index],
-                    forward_batch,
-                    input_ids=input_ids,
-                    cp_all_tokens=cp_extend,
-                )
+                if i in prefetched_rows:
+                    rows, ev = prefetched_rows.pop(i)
+                    main_stream = torch.cuda.current_stream()
+                    main_stream.wait_event(ev)
+                    rows.record_stream(main_stream)
+                    if engram.embed.tp_size > 1:
+                        rows = engram.embed._reduce_owned_rows(rows)
+                    hidden_states = engram.gate_rows(state.residual, rows, input_ids)
+                else:
+                    hidden_states = engram(
+                        state.residual,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        input_ids=input_ids,
+                        cp_all_tokens=cp_extend,
+                    )
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
