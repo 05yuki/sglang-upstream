@@ -88,7 +88,12 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
         self.moe_runner_config = moe_runner_config
 
-        E = layer.num_local_experts
+        # Under the kt-kernel wrapper this method holds only the GPU-resident
+        # experts, while layer.num_local_experts still counts every routed
+        # expert, so the per-expert tensors below have to be sized from the
+        # weights that actually exist or FlashInfer rejects them
+        # (swiglu_limit must have num_experts_on_rank elements: 384 vs 7).
+        E = layer.w13_weight.shape[0]
         device = layer.w13_weight.device
         if self._use_mxfp8_act_scaling:
             # FlashInfer's MXFP4 ABI requires a neutral per-expert global scale.
