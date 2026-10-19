@@ -6089,6 +6089,11 @@ class Scheduler(
 
 
 def dispatch_event_loop(scheduler: Scheduler):
+    if os.environ.get("KT_PREFILL_LEND_PROBE"):
+        # measure the prefill lend before serving
+        from sglang.srt.layers.moe import kt_lend_probe
+
+        kt_lend_probe.run(scheduler)
     if scheduler.server_args.enable_pd_role_switch:
         return role_switch.run_event_loop_supervisor(
             scheduler,

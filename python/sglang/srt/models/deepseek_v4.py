@@ -1371,7 +1371,11 @@ class MqaAttentionBase(nn.Module):
             assert not getattr(meta, "q_pad_captured", False), (
                 "the padded query buffer grew after a CUDA graph captured it"
             )
-            buf = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
+            # a prefill window's buffer goes with the lend's scratch
+            from sglang.srt.layers.moe import kt_lend
+
+            with kt_lend.scratch_region():
+                buf = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
             if meta is not None:
                 try:
                     meta.q_pad_buffer = buf
@@ -4266,6 +4270,10 @@ class DeepseekV4Model(nn.Module):
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
+                    from sglang.srt.layers.moe import kt_lend
+
+                    # reads the layer's weights before it runs
+                    kt_lend.enter(source)
                     if _is_hip and source.hc_boundary_fused:
                         # The previous FFN hc_post has not run yet, so run it here too.
                         source_x = fused_boundary_attn_input(source, state)

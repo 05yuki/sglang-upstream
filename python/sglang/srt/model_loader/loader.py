@@ -307,6 +307,10 @@ def _initialize_model(
         model = model_class(**kwargs)
         check_stage_producers(model)
     model.shared_experts_config = shared_experts
+    # before any weight loads: the prefill lend binds the model's layers
+    from sglang.srt.layers.moe import kt_lend
+
+    kt_lend.bind_model(model)
     return model
 
 
@@ -1085,6 +1089,14 @@ class DefaultModelLoader(BaseModelLoader):
             # parameters onto device for processing and back off after.
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
+            from sglang.srt.layers.moe import kt_lend
+
+            kt_lend.after_module(module)
+
+        # the prefill lend, before the KV pool is sized (no-op outside a load)
+        from sglang.srt.layers.moe import kt_lend
+
+        kt_lend.after_load()
 
     @staticmethod
     def restore_weights_before_loading(model, target_device):
