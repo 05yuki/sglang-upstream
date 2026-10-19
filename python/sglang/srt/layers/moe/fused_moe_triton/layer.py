@@ -1306,6 +1306,13 @@ class FusedMoE(torch.nn.Module):
         ):
             if self.quant_method.num_gpu_experts != -1:
                 if expert_id >= self.quant_method.num_gpu_experts:
+                    # kt_kv_hot_lend: experts N..N+X-1 load into the layer's shadow
+                    from sglang.srt.layers.moe import kt_kv_hot_lend
+
+                    hot = kt_kv_hot_lend.shadow_param(self.quant_method, self, param, expert_id)
+                    if hot is not None:
+                        self._weight_loader_impl(param=hot[0], loaded_weight=loaded_weight,
+                                                 weight_name=weight_name, shard_id=shard_id, expert_id=hot[1])
                     return
 
         self._weight_loader_impl(
