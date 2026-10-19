@@ -1133,14 +1133,19 @@ def select_candidate_blocks(
     compress_lens: torch.Tensor | int,
     topk_blocks: int,
     block_size: int,
+    expand: bool = True,
 ) -> torch.Tensor:
     """Level one of the two-level top-k: a bool mask over positions keeping the
     topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
     in logits, so an all -inf block means not reachable yet; the block holding the
     query's newest position is always kept."""
     width = logits.size(-1)
-    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
-    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    # no padded copy of the [T, prefix] logits (384 MiB at 48K, and the OOM of
+    # a long prefill): block maxima over the full blocks, the tail on its own
+    full = width - width % block_size
+    scores = logits[..., :full].unflatten(-1, (-1, block_size)).amax(dim=-1)
+    if full < width:
+        scores = torch.cat([scores, logits[..., full:].amax(dim=-1, keepdim=True)], dim=-1)
     num_blocks = scores.size(-1)
 
     last = (compress_lens - 1) // block_size
@@ -1152,4 +1157,6 @@ def select_candidate_blocks(
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
         -1, top.indices, top.values > -torch.inf
     )
+    if not expand:
+        return keep  # [..., blocks]: the decision per block, not yet per position
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
