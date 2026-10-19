@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.arg_groups.overrides import model_config_of
+from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
     get_exec,
@@ -153,7 +154,12 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
 
 _routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
 _gpu_mask_zero = os.environ.get("KT_GPU_MASK_ZERO") == "1"
+_hot_check = os.environ.get("KT_HOT_CHECK") == "1"
 _routing_state = {}
+# layer_idx -> KTEPWrapperMethod on the rank that owns the kt-kernel wrapper
+# (rank 0); the streamed-prefill zero-copy path hands every layer's expert
+# arenas to the other ranks in one go.
+KT_LAYERS = {}
 
 
 def _routing_count(device, layer_idx, topk_ids, rank):
@@ -184,10 +190,12 @@ def _routing_count(device, layer_idx, topk_ids, rank):
 
 
 def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
-    """{"swiglu_limit": limit} for KTMoEWrapper when the layer clamps its SwiGLU, else {}.
-    The value is what the resident GPU runner applies: moe_runner_config.swiglu_limit
-    (DeepSeek V4: gate <= limit, |up| <= limit before silu(gate) * up). Without it the
-    CPU experts run unclamped. KT_SWIGLU_CLAMP=0 leaves it out."""
+    """{"swiglu_limit": limit} for KTMoEWrapper when the layer clamps its
+    SwiGLU, else {} (older kt-kernel builds keep working for models without
+    a clamp). The value is what the resident GPU runner applies:
+    moe_runner_config.swiglu_limit (DeepSeek V4: gate <= limit, |up| <= limit
+    before silu(gate) * up). KT_SWIGLU_CLAMP=0 leaves it out, the behaviour
+    before 10-12."""
     if os.environ.get("KT_SWIGLU_CLAMP", "1") == "0":
         return {}
     cfg = getattr(layer, "moe_runner_config", None)
@@ -197,7 +205,7 @@ def _kt_swiglu_kwargs(layer: torch.nn.Module) -> dict:
     if getattr(cfg, "gemm1_alpha", None) is not None or getattr(cfg, "gemm1_clamp_limit", None) is not None:
         raise RuntimeError(
             "KT_SWIGLU_CLAMP: this layer uses gemm1_alpha/gemm1_clamp_limit, which "
-            "the KT CPU wrapper does not map; set KT_SWIGLU_CLAMP=0"
+            "the KT CPU wrapper in this tree does not map; set KT_SWIGLU_CLAMP=0"
         )
     return {"swiglu_limit": float(limit)}
 
@@ -309,6 +317,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
             gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
             gpu_mask[: self.num_gpu_experts] = True
+            KT_LAYERS[self.kt_config.layer_idx] = self
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
@@ -364,6 +373,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
             _drop_checkpoint_cache(self.kt_config.layer_idx, getattr(self.kt_config, "num_layers", 0) or 0)
             self.wrapper.load_weights(physical_to_logical_map_cpu)
+        # Last layer loaded on this rank: optionally build the streamer and
+        # pin every layer's arenas now (KT_GPU_STREAM_EARLY_INIT).
+        num_layers = getattr(self.kt_config, "num_layers", None)
+        if num_layers and self.kt_config.layer_idx == num_layers - 1:
+            from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_init_early
+
+            stream_prefill_init_early(self, layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -472,9 +488,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if _routing_dump_prefix and self.tp_rank == 0:
             _routing_count(x.device, self.kt_config.layer_idx, topk_output.topk_ids, self.tp_rank)
 
+        # KT_GPU_STREAM_PREFILL=<tokens>: above that many tokens the CPU
+        # experts are streamed to the GPU in groups instead of computed here
+        # (kt_stream_prefill.py). The ids are taken before the mask below
+        # mutates them in place.
+        streamer = stream_prefill_for(self, layer, x.shape[0])
+        cpu_share = False
+        if streamer is not None:
+            physical_ids = topk_output.topk_ids.clone()
+            from sglang.srt.layers.moe.kt_stream_prefill import stream_cpu_cutoff
+
+            cutoff = stream_cpu_cutoff(self, streamer)
+            if cutoff < self.global_num_experts and self.tp_rank == 0:
+                if self.num_gpu_experts <= 0:
+                    raise RuntimeError("KT_STREAM_CPU_GROUPS needs --kt-num-gpu-experts > 0")
+                # Everything below the cutoff is streamed or resident: send it
+                # to GPU expert 0 at weight 0, which kt-kernel skips.
+                theirs = physical_ids < cutoff
+                cpu_do = dispatch_output._replace(
+                    topk_output=topk_output._replace(
+                        topk_ids=torch.where(theirs, torch.zeros_like(physical_ids), physical_ids),
+                        topk_weights=torch.where(
+                            theirs, torch.zeros_like(topk_output.topk_weights), topk_output.topk_weights
+                        ),
+                    )
+                )
+                self.submit(layer, cpu_do)
+                cpu_share = True
+
 
         # Step 1: Submit CPU expert computation (non-blocking)
-        if self.tp_rank == 0:
+        if streamer is None and self.tp_rank == 0:
             self.submit(layer, dispatch_output)
 
         # Step 2: Prepare GPU computation by masking CPU expert IDs
@@ -486,10 +530,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if _gpu_mask_zero:
             # KT_GPU_MASK_ZERO=1: the Marlin MoE path cannot take -1 ids (its
             # alignment kernels index weights with them: illegal address at
-            # graph capture). Send the CPU-bound rows to GPU expert 0 with a
-            # zero routing weight instead (the second GEMM multiplies by the
-            # weight, so they add nothing) and hand the ids over as int64 so
-            # fused_marlin_moe takes its generic alignment path.
+            # graph capture, 09-13). Send the CPU-bound rows to GPU expert 0
+            # with a zero routing weight instead — the second GEMM multiplies
+            # by the weight, so they add nothing — and hand the ids over as
+            # int64 so fused_marlin_moe takes its generic alignment path,
+            # which is fine with duplicate ids within a token.
             m = masked_topk_ids < 0
             masked_topk_output = topk_output._replace(
                 topk_ids=torch.where(m, torch.zeros_like(masked_topk_ids), masked_topk_ids).to(torch.int64),
@@ -503,15 +548,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 3: Execute GPU expert computation (any quantization method)
         # This runs in parallel with CPU computation. With no resident GPU
-        # experts (--kt-num-gpu-experts 0) there is nothing to run, and the
-        # FlashInfer MXFP4 runner refuses a zero-expert workspace.
+        # experts (--kt-num-gpu-experts 0, every slot given to the streamer
+        # and the KV pool) there is nothing to run and the FlashInfer MXFP4
+        # runner refuses a zero-expert workspace (09-16).
         if self.num_gpu_experts > 0:
-            output = self.gpu_method.apply(layer, masked_dispatch_output).hidden_states
+            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+            output = gpu_combine_input.hidden_states
+            if streamer is not None and _hot_check:
+                from sglang.srt.layers.moe.kt_stream_prefill import hot_reference_check
+
+                hot_reference_check(self, layer, x, physical_ids, topk_output.topk_weights, output, streamer)
         else:
             output = torch.zeros_like(x)
 
         # Step 4: Synchronize CPU results and merge with GPU results
-        if self.tp_rank == 0:
+        if streamer is not None:
+            output = output + streamer.run(self, layer, dispatch_output, physical_ids)
+            if cpu_share:
+                output = output + self.sync(x)
+        elif self.tp_rank == 0:
             cpu_output = self.sync(x)
             output = output + cpu_output
 
