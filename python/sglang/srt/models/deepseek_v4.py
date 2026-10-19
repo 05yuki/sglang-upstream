@@ -20,6 +20,7 @@ from typing import (
     Union,
 )
 
+import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,6 +50,45 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+
+_KT_EXPERT_NAME = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+
+
+def _kt_cpu_only_experts(model) -> dict:
+    """{layer_id: frozenset(logical expert ids with no GPU slot)} for every
+    MoE layer whose quant method is the KT wrapper; {} when there is none or
+    KT_LOAD_SKIP_CPU_EXPERTS=0."""
+    import os
+
+    if os.environ.get("KT_LOAD_SKIP_CPU_EXPERTS", "1") != "1":
+        return {}
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+
+    meta = get_global_expert_location_metadata()
+    out = {}
+    for module in model.modules():
+        qm = getattr(module, "quant_method", None)
+        if not isinstance(module, FusedMoE) or not isinstance(qm, KTEPWrapperMethod):
+            continue
+        if qm.num_gpu_experts == -1 or getattr(module, "layer_id", None) is None:
+            continue
+        cpu_only = set()
+        for logical in range(meta.num_logical_experts):
+            on_gpu = False
+            for phys in meta.logical_to_all_physical(module.layer_id, logical):
+                local = module._map_global_expert_id_to_local_expert_id(phys)
+                # kt_kv_hot_lend: the shadow's experts load too
+                if 0 <= local < module.num_local_experts and local < getattr(
+                        qm, "load_gpu_experts", qm.num_gpu_experts):
+                    on_gpu = True
+                    break
+            if not on_gpu:
+                cpu_only.add(logical)
+        out[module.layer_id] = frozenset(cpu_only)
+    return out
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
@@ -4833,6 +4873,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
+        kt_cpu_only = _kt_cpu_only_experts(self) if not is_nextn else {}
+        kt_skipped = 0
 
         fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
@@ -4892,6 +4934,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
+                    if kt_cpu_only:
+                        m = _KT_EXPERT_NAME.match(name)
+                        if m and int(m.group(2)) in kt_cpu_only.get(int(m.group(1)), ()):
+                            kt_skipped += 1
+                            continue
 
                     # V4.1 checkpoint tensors with no module in the text model yet;
                     # the per-group count is logged after loading.
