@@ -1284,7 +1284,12 @@ class DeepseekV2MoE(nn.Module):
             not _is_cuda
             and not _is_musa
             and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            # KT applies the topk weights as given: scale here only when the topk
+            # did not already fold the factor into them.
+            or (
+                isinstance(self.experts.quant_method, KTEPWrapperMethod)
+                and not self.routed_scaling_factor_fused_in_topk
+            )
         ):
             final_hidden_states *= self.routed_scaling_factor
 
@@ -1482,7 +1487,12 @@ class DeepseekV2MoE(nn.Module):
             and not _is_musa
             and not _is_xpu
             and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            # KT applies the topk weights as given: scale here only when the topk
+            # did not already fold the factor into them.
+            or (
+                isinstance(self.experts.quant_method, KTEPWrapperMethod)
+                and not self.routed_scaling_factor_fused_in_topk
+            )
         ):
             final_hidden_states *= self.routed_scaling_factor
 
