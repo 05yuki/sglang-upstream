@@ -9,6 +9,7 @@ from available GPU memory using a unified coeff+bias model:
 from __future__ import annotations
 
 import logging
+import os
 from bisect import bisect_right
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -1639,6 +1640,35 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"or SGLANG_SWA_EVICTION_INTERVAL, or increase --mem-fraction-static."
             )
 
+        from sglang.srt.mem_cache import dsv41_host_kv
+
+        dsv41_host_kv.PLAN["device_tokens"] = None
+        if (
+            dsv41_host_kv.host_kv_enabled()
+            and not self._unified
+            and self.stage_owner_layers.keys() & {1, 2}
+            and full_token < self.context_len
+        ):
+            # The pool covers the whole context. The GPU keeps every byte but the
+            # ratio-1/2 compressed KV's, which it holds as far as the budget goes; the
+            # rest of it lives in host memory (dsv41_host_kv).
+            kv_part = sum(
+                self._get_paged_kv_bytes_per_token(ratio) / ratio * len(layers)
+                for ratio, layers in self.stage_owner_layers.items()
+                if ratio in (1, 2)
+            )
+            rest = self.bytes_per_full_token - kv_part
+            device_tokens = int(
+                max(0.0, available_bytes_for_tokens - self.context_len * rest) // kv_part
+            )
+            device_tokens = min(device_tokens, self.context_len) // page_size * page_size
+            logger.info(
+                f"DSV4.1 host KV: the pool covers the context, {full_token} -> {self.context_len} "
+                f"tokens; the GPU holds the compressed KV of {device_tokens} "
+                f"({kv_part:.0f} of {self.bytes_per_full_token:.0f} B a token), host memory the rest"
+            )
+            full_token = self.context_len
+            dsv41_host_kv.PLAN["device_tokens"] = device_tokens
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
             f"DSV4 memory calculation: unified={self._unified}, "

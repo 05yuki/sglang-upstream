@@ -152,7 +152,7 @@ def _whole_chunks(tensors, mark, n: int, dev):
 
 def _setup(runner) -> bool:
     if STATE["alloc"] is not None:
-        return True
+        return not STATE.get("spare_only")
     if STATE.get("off"):
         return False
     STATE["off"] = True  # until set up
@@ -173,9 +173,17 @@ def _setup(runner) -> bool:
     n = int(getattr(a, "num_pages", 0) or a.size // a.page_size)
     tensors = _kv_tensors(kvp, n, a.page_size)
     if not tensors:
+        if HOT:
+            # nothing to unmap (V4.1's compressed KV in host memory): the hot lend can
+            # still take the driver's spare, and gives it back at the same windows
+            STATE.update(alloc=a, tensors=[], chunk=0, ps=a.page_size, n=n, off=False, spare_only=True)
+            _log("the hot lend takes the driver's spare only")
         return False
     chunk = max(t[2] for t in tensors)
-    STATE.update(alloc=a, tensors=tensors, chunk=chunk, ps=a.page_size, n=n, off=False)
+    # pages wholly in every tensor's device part (a split range's tail is host memory)
+    dev_pages = min(kt_kv_vmm.device_bytes(t[0]) // t[1] for t in tensors)
+    STATE.update(alloc=a, tensors=tensors, chunk=chunk, ps=a.page_size, n=n, off=False,
+                 dev_pages=dev_pages if dev_pages < n + 1 else None)
     _wrap_allocator(a)
     _log(f"{len(tensors)} K/V tensors of {kvp.__class__.__name__}, {n} pages of {a.page_size} tokens "
          f"({min(t[1] for t in tensors)}-{max(t[1] for t in tensors)} B a page per tensor), "
@@ -267,6 +275,11 @@ def _release_free(keep_pages: int):
     if free.numel() <= keep_pages:
         return None
     cand = free[keep_pages:]
+    if STATE.get("dev_pages") is not None:
+        # a pool whose tail is host memory (dsv41_host_kv): only device pages lend
+        cand = cand[cand < STATE["dev_pages"]]
+        if cand.numel() == 0:
+            return None
     mark = torch.zeros(n + 2, dtype=torch.int32, device=dev)
     mark[cand] = 1
     torch.cuda.synchronize(dev)
@@ -288,18 +301,31 @@ def decode_lend(runner, reserve_tokens: int, min_bytes: int) -> int:
     """The hot lend, outside prefill: every free page beyond reserve_tokens (and a
     page a running request) leaves the free list and its whole chunks are unmapped,
     when that is at least min_bytes. Returns the bytes unmapped (0: nothing lent)."""
-    if not HOT or STATE["lent"] is not None or runner is None or not _setup(runner):
+    if not HOT or STATE["lent"] is not None or runner is None:
         return 0
+    if not _setup(runner):
+        if not STATE.get("spare_only") or min_bytes > 1:
+            return 0
+        STATE.update(lent=STATE["alloc"].free_pages[:0].clone(), ranges=[], bytes=0, owner="hot")
+        STATE["hot_lends"] += 1
+        return 1
     a, ps = STATE["alloc"], STATE["ps"]
     keep = -(-reserve_tokens // ps) + 1
     free = _free_count(a)
     if free <= keep:
         return 0
+    if STATE.get("dev_pages") is not None:
+        free = min(free, STATE["dev_pages"])  # only device pages lend
     est = sum(max(0, (free - keep) * pb - 2 * c) for _, pb, c, _ in STATE["tensors"])
-    if est < min_bytes:
+    if est < min_bytes and not (STATE.get("dev_pages") is not None and min_bytes <= 1):
         return 0
     got = _release_free(keep)
     if got is None:
+        if STATE.get("dev_pages") is not None and min_bytes <= 1:
+            # a split pool with no free device page to lend: the driver's spare alone
+            STATE.update(lent=a.free_pages[:0].clone(), ranges=[], bytes=0, owner="hot")
+            STATE["hot_lends"] += 1
+            return 1
         return 0
     cand, _, ranges, total = got
     STATE.update(lent=cand, ranges=ranges, bytes=total, owner="hot")

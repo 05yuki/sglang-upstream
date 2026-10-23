@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import (
     FrozenSet,
@@ -335,6 +336,15 @@ class DeepSeekV4SingleKVPool(KVCache):
             )
         assert self.store_dtype == torch.uint8
 
+        device_tokens = getattr(self, "device_tokens", None)
+        if device_tokens is not None:
+            from sglang.srt.mem_cache.dsv41_host_kv import make_pool_buffer
+
+            # a pool page holds one full page's entries; page 0 is the reserved one
+            device_pages = 1 + device_tokens // self.global_page_size
+            self.host_part = device_pages < num_pages
+            self.device_pages = device_pages
+            return make_pool_buffer((num_pages, self.bytes_per_page_padded), self.device, device_pages)
         return torch.zeros(
             num_pages,
             self.bytes_per_page_padded,
@@ -955,6 +965,15 @@ class DeepSeekV4UnifiedKVPool:
         return data_ptrs, data_lens, item_lens
 
 
+class HostMappedSingleKVPool(DeepSeekV4SingleKVPool):
+    """A ratio-1/2 compressed KV pool whose pages past `device_tokens` live in host memory
+    (dsv41_host_kv.make_pool_buffer); subclassed with device_tokens set."""
+
+    device_tokens = None
+    host_part = False
+    device_pages = 0
+
+
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     # object.__new__ stubs (disagg wire test) skip __init__; False is the env
     # default, so the fp8 PD/HiCache refuses don't AttributeError on them.
@@ -1303,6 +1322,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             kv_pool_cls=kv_pool_cls,
         )
 
+        self.host_low_ratio = None
+        if any(getattr(p, "host_part", False) for p in self.kv_pools.values()):
+            from sglang.srt.mem_cache.dsv41_host_kv import HostLowRatioKV
+
+            self.host_low_ratio = HostLowRatioKV(
+                layouts={
+                    r: (
+                        p.kv_layout.data_bytes,
+                        p.kv_layout.scale_bytes,
+                        p.page_size,
+                        p.bytes_per_page_padded,
+                    )
+                    for r, p in self.kv_pools.items()
+                    if getattr(p, "host_part", False)
+                },
+                topk=int(os.environ.get("SGLANG_DSV41_HOST_KV_TOPK", "512")),
+                max_rows=int(os.environ.get("SGLANG_DSV41_HOST_KV_MAX_ROWS", "16")),
+                device=device,
+            )
+            parts = [p for p in self.kv_pools.values() if getattr(p, "host_part", False)]
+            host_b = sum((p.kv_buffer[0].shape[0] - p.device_pages) * p.kv_buffer[0].shape[1] * len(p.kv_buffer) for p in parts)
+            dev_b = sum(min(p.device_pages, p.kv_buffer[0].shape[0]) * p.kv_buffer[0].shape[1] * len(p.kv_buffer) for p in parts)
+            logger.info(
+                f"DSV4.1 host KV: the ratio-1/2 compressed KV's first {parts[0].device_pages} of "
+                f"{parts[0].kv_buffer[0].shape[0]} pages on the GPU ({dev_b / 2**30:.2f} GiB), "
+                f"the rest in host memory ({host_b / 2**30:.2f} GiB)"
+            )
+
         # The distinct compress ratios this stage has, sorted. Registry pools kept
         # for a ratio the model lacks (wire-layout alignment) do not count.
         model_ratios = set(self.compression_ratios)
@@ -1603,6 +1650,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     cls=pool_cls,
                     kv_layout=self.compressed_kv_layout(ratio),
                 )
+            from sglang.srt.mem_cache.dsv41_host_kv import PLAN
+
+            device_tokens = PLAN["device_tokens"] if kv_pool_cls is DeepSeekV4SingleKVPool else None
+            split_cls = (
+                type("SplitSingleKVPool", (HostMappedSingleKVPool,), {"device_tokens": device_tokens})
+                if device_tokens is not None
+                else None
+            )
             for ratio, sources in low_ratio_sources.items():
                 self.kv_pools[ratio] = self._make_kv_pool(
                     size=self.full_size // ratio,
@@ -1612,7 +1667,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     device=device,
                     enable_memory_saver=enable_memory_saver,
                     global_page_size=page_size,
-                    cls=kv_pool_cls,
+                    cls=split_cls or kv_pool_cls,
                     kv_layout=self.compressed_kv_layout(ratio),
                 )
 

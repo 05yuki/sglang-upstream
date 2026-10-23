@@ -1253,6 +1253,10 @@ class DeepseekV4AttnBackend(
         assert self.token_to_kv_pool.swa_page_size % SWA_WINDOW == 0
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        if getattr(self.token_to_kv_pool, "host_low_ratio", None) is not None:
+            from sglang.srt.mem_cache.dsv41_host_kv import keep_free_pages_sorted
+
+            keep_free_pages_sorted(model_runner.token_to_kv_pool_allocator)
         # Nothing is built for a compress ratio outside the pool's set.
         self.present_ratios: Tuple[int, ...] = self.token_to_kv_pool.present_ratios
         self.low_ratios: Tuple[int, ...] = tuple(
@@ -3432,6 +3436,31 @@ class DeepseekV4AttnBackend(
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
         if run_indexer and layer.indexer is not None:
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
+        self._stage_host_low_ratio(layer, forward_batch)
+
+    def _stage_host_low_ratio(self, layer, forward_batch: ForwardBatch) -> None:
+        """SGLANG_DSV41_HOST_KV: after an index source's top-k, gather its rows of the
+        host-resident compressed KV into the device staging this ratio's decode attention
+        reads (the following layers of the ratio reuse it, as they reuse the top-k)."""
+        host_kv = getattr(self.token_to_kv_pool, "host_low_ratio", None)
+        if host_kv is None or layer.indexer is None:
+            return
+        ratio = self.token_to_kv_pool.layer_mapping[layer.layer_id][0]
+        indices = self.forward_metadata.core_attn_metadata.sparse_page_indices(ratio)
+        src = self.token_to_kv_pool.get_extra_key_buffer(layer.layer_id)
+        if forward_batch.forward_mode.is_decode():
+            if host_kv.covers(ratio, indices):
+                host_kv.gather(ratio, src, indices)
+
+    def _max_token_slot(self, fb: ForwardBatch) -> int:
+        """The highest KV slot any request of the batch holds (prefix and this chunk)."""
+        cached = getattr(fb, "dsv41_max_token_slot", None)
+        if cached is None:
+            locs = self.req_to_token[fb.req_pool_indices, : int(fb.seq_lens.max())]
+            live = torch.arange(locs.shape[1], device=locs.device) < fb.seq_lens[:, None]
+            cached = int(locs[live].max())
+            fb.dsv41_max_token_slot = cached
+        return cached
 
     def _forward_low_ratio_sources_cp(
         self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
@@ -4103,6 +4132,27 @@ class DeepseekV4AttnBackend(
                 extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
                     compress_ratio
                 )
+                host_kv = getattr(token_to_kv_pool, "host_low_ratio", None)
+                if (
+                    host_kv is not None
+                    and forward_batch.forward_mode.is_decode()
+                    and host_kv.covers(compress_ratio, extra_indices)
+                ):
+                    # The index source's rows, gathered from host memory; renumbered.
+                    extra_k_cache = host_kv.stage[compress_ratio]
+                    extra_indices = host_kv.remap[compress_ratio][: extra_indices.shape[0]]
+                elif host_kv is not None and forward_batch.forward_mode.is_extend():
+                    # Prefill: the pool layer's used pages, copied to the GPU at the first
+                    # layer that reads them in this forward and shared by the rest
+                    pool_layer = token_to_kv_pool.layer_mapping[layer_id][1]
+                    extra_k_cache = host_kv.prefill_copy(
+                        forward_batch,
+                        compress_ratio,
+                        pool_layer,
+                        extra_k_cache,
+                        lambda: self._max_token_slot(forward_batch),
+                        layer_id,
+                    )
 
             swa_kv_page_size = token_to_kv_pool.get_swa_key_page_size()
             assert swa_k_cache.ndim == 2

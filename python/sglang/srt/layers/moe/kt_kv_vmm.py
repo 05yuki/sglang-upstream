@@ -77,6 +77,11 @@ def _load():
     if hasattr(_lib, "kv_vmm_malloc_shadow"):
         _lib.kv_vmm_malloc_shadow.restype = ctypes.c_void_p
         _lib.kv_vmm_malloc_shadow.argtypes = [ctypes.c_ssize_t, ctypes.c_int]
+    if hasattr(_lib, "kv_vmm_malloc_split"):
+        _lib.kv_vmm_malloc_split.restype = ctypes.c_void_p
+        _lib.kv_vmm_malloc_split.argtypes = [ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_int]
+        _lib.kv_vmm_device_bytes.restype = ctypes.c_size_t
+        _lib.kv_vmm_device_bytes.argtypes = [ctypes.c_void_p]
     _lib.kv_vmm_free.restype = None
     _lib.kv_vmm_free.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p]
     if not DIRECT:
@@ -89,9 +94,11 @@ class _Block:
     """One kv_vmm allocation, owned by the tensor made over it (torch keeps the
     object of a __cuda_array_interface__ alive as long as the tensor)."""
 
-    def __init__(self, nbytes: int, device: int, lazy: bool = False, shadow: bool = False):
+    def __init__(self, nbytes: int, device: int, lazy: bool = False, shadow: bool = False, split=None):
         self.nbytes, self.device = nbytes, device
-        if shadow:
+        if split is not None:
+            self.ptr = _lib.kv_vmm_malloc_split(nbytes, device, split[0], split[1])
+        elif shadow:
             self.ptr = _lib.kv_vmm_malloc_shadow(nbytes, device)
         else:
             self.ptr = _lib.kv_vmm_malloc_lazy(nbytes, device) if lazy else _lib.kv_vmm_malloc(nbytes, device, None)
@@ -207,6 +214,30 @@ def shadow_tensor(shape, dtype, device: int) -> torch.Tensor:
     with torch.cuda.device(device):
         t = torch.as_tensor(_Block(max(1, size_b), device, shadow=True), device=f"cuda:{device}")
     return t[:size_b].view(dtype).view(tuple(int(d) for d in shape))
+
+
+def split_tensor(shape, dtype, device: int, device_bytes: int, numa: int) -> torch.Tensor:
+    """A zeroed tensor whose first device_bytes are device memory and the rest host
+    memory of NUMA node numa, one range the GPU addresses as a whole (DeepSeek-V4.1's
+    compressed KV past what the GPU holds). release / restore leave the host part."""
+    lib = _load()
+    if not hasattr(lib, "kv_vmm_malloc_split"):
+        raise RuntimeError(f"{_LIB_PATH} has no kv_vmm_malloc_split: rebuild it from kv_vmm.c")
+    n = 1
+    for d in shape:
+        n *= int(d)
+    size_b = n * dtype.itemsize
+    with torch.cuda.device(device):
+        t = torch.as_tensor(_Block(max(1, size_b), device, split=(max(0, device_bytes), numa)), device=f"cuda:{device}")
+    return t[:size_b].view(dtype).view(tuple(int(d) for d in shape)).zero_()
+
+
+def device_bytes(t: torch.Tensor) -> int:
+    """How many bytes from the start of t's kv_vmm range are device memory."""
+    lib = _load()
+    if not hasattr(lib, "kv_vmm_device_bytes"):
+        return t.nbytes
+    return int(lib.kv_vmm_device_bytes(ctypes.c_void_p(t.data_ptr())))
 
 
 def chunk_bytes(device: int) -> int:
