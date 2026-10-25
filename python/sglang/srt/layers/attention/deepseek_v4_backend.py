@@ -208,8 +208,14 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
 
 
+def _use_sm89_sparse_attention() -> bool:
+    # Ada has BF16 tensor cores, but cannot run FlashMLA's SM90+ kernels.
+    # Match the runtime platform exactly; native SM90/SM100/SM120 paths stay intact.
+    return _is_cuda and get_platform().device_capability == (8, 9)
+
+
 def _create_flashmla_metadata():
-    if get_platform().is_sm120 or _is_xpu:
+    if get_platform().is_sm120 or _is_xpu or _use_sm89_sparse_attention():
         return None
     from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
 
@@ -2925,6 +2931,7 @@ class DeepseekV4AttnBackend(
             and forward_batch.forward_mode.is_extend_without_speculative()
             and not is_cp_active(forward_batch)
             and not get_platform().is_sm120
+            and not _use_sm89_sparse_attention()
             and self.forward_metadata.late_layer_tail is None
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
@@ -4332,7 +4339,24 @@ class DeepseekV4AttnBackend(
                     extra_topk_lengths,
                 )
 
-            if get_platform().is_sm120:
+            if _use_sm89_sparse_attention():
+                from sglang.kernels.ops.attention.sm89_dual_scope import (
+                    flash_mla_sparse_sm89,
+                )
+
+                o = flash_mla_sparse_sm89(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    head_dim_v=self.head_dim_v,
+                    softmax_scale=self.softmax_scale,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )
+            elif get_platform().is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     SM120_DECODE_MAX_TOKENS,
                     flash_mla_with_kvcache_sm120,
