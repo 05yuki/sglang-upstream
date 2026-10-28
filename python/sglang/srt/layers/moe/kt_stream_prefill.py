@@ -72,6 +72,14 @@ USE_GRAPH = os.environ.get("KT_GPU_STREAM_GRAPH", "1") == "1"
 # Costs one bf16 buffer of G experts (G x 25 MB on V4-Flash); the raw DMA
 # slots stay packed, so PCIe traffic is unchanged.
 W16 = os.environ.get("KT_GPU_STREAM_W16", "0") == "1"
+# KT_GPU_STREAM_MMQ=1 (with ZEROCOPY and W16): each group's MXFP4 bytes are
+# regrouped into ggml block_mxfp4 on the GPU and multiplied by llama.cpp's MMQ (kt_gguf_moe_mmq: int8 mma, the
+# activations and the swiglu intermediate quantized per 32 values with an fp16 scale) instead of a bf16 copy and
+# the bf16 CUTLASS MoE. The weights stay exact. A group's routes go through the kernels KT_GPU_STREAM_MMQ_ROUTES
+# at a time.
+MMQ = os.environ.get("KT_GPU_STREAM_MMQ", "0") == "1"
+MMQ_ROUTES = int(os.environ.get("KT_GPU_STREAM_MMQ_ROUTES", "8192") or 0)
+GGML_TYPE_MXFP4 = 39
 # sglang-kt-stream-row-block-dsv41.py: rows per CUTLASS MoE call (0 = the chunk);
 # the W16 group body and the resident experts' call during a streamed prefill
 ROW_BLOCK = int(os.environ.get("KT_GPU_STREAM_ROW_BLOCK", "0") or 0)
@@ -232,6 +240,48 @@ def _mxfp4_dequant(packed: torch.Tensor, packed_stride: int, scales_f32: torch.T
     _mxfp4_dequant_kernel[grid](
         packed, scales_f32, out, n_elems, cols, packed_stride, scale_stride, out.stride(0),
         in_cols // 2, in_cols // 32, col_off, out.stride(1), BLOCK=BLOCK
+    )
+
+
+@triton.jit
+def _mxfp4_blocks_kernel(
+    packed_ptr, scale_ptr, out_ptr,
+    n_blocks, nb, packed_stride, scale_stride, out_stride, in_rs, s_rs, out_rs,
+    BB: tl.constexpr,
+):
+    """kt-kernel's MXFP4 (e2m1 pairs, low nibble first, in_rs bytes a row; an fp32 power-of-two scale per 32
+    values, s_rs a row) to ggml block_mxfp4 (the scale's E8M0 byte, then 16 bytes holding values j and j + 16 in
+    their low and high nibbles, out_rs bytes a row), BB blocks per program_id(0), one expert per program_id(1)."""
+    e = tl.program_id(1)
+    blk = tl.program_id(0) * BB + tl.arange(0, BB)
+    m = blk < n_blocks
+    row = blk // nb
+    kb = blk % nb
+    src = packed_ptr + e * packed_stride + row * in_rs + kb * 16
+    j = tl.arange(0, 16)
+    sh = (j % 2) * 4
+    lo = tl.load(src[:, None] + (j // 2)[None, :], mask=m[:, None], other=0).to(tl.int32)
+    hi = tl.load(src[:, None] + (8 + j // 2)[None, :], mask=m[:, None], other=0).to(tl.int32)
+    qs = ((lo >> sh[None, :]) & 15) | (((hi >> sh[None, :]) & 15) << 4)
+    sc = tl.load(scale_ptr + e * scale_stride + row * s_rs + kb, mask=m, other=1.0)
+    ex = (sc.to(tl.int32, bitcast=True) >> 23) & 255
+    dst = out_ptr + e * out_stride + row * out_rs + kb * 17
+    tl.store(dst, ex.to(tl.uint8), mask=m)
+    tl.store(dst[:, None] + 1 + j[None, :], qs.to(tl.uint8), mask=m[:, None])
+
+
+def _mxfp4_blocks(packed: torch.Tensor, packed_stride: int, scales_f32: torch.Tensor, scale_stride: int,
+                  out: torch.Tensor, n: int, rows: int, cols: int, in_cols: int = 0, col_off: int = 0):
+    """n experts of [rows, cols] from the raw slot tensors (strides in bytes / floats; rows of in_cols values,
+    cols when 0, of which columns col_off.. are taken) into out [n, rows, >= cols / 32 * 17] uint8 (ggml
+    block_mxfp4 rows at out's row stride)."""
+    in_cols = in_cols or cols
+    nb = cols // 32
+    n_blocks = rows * nb
+    BB = 64
+    _mxfp4_blocks_kernel[(triton.cdiv(n_blocks, BB), n)](
+        packed[:, col_off // 2:], scales_f32[:, col_off // 32:], out, n_blocks, nb, packed_stride, scale_stride,
+        out.stride(0), in_cols // 2, in_cols // 32, out.stride(1), BB=BB,
     )
 
 
@@ -971,6 +1021,100 @@ class KTStreamPrefill:
             self._cutlass_fused_moe(**part)
         return kw["output"]
 
+    # -- KT_GPU_STREAM_MMQ: block_mxfp4 groups through llama.cpp's MMQ ----------------------------------
+
+    def _mmq_buffers(self):
+        """One set of block_mxfp4 group buffers in the lend scratch, each followed by the bytes MMQ reads past
+        the last row (zeroed at every layer: the scratch is mapped again at every window's start)."""
+        from sglang.srt.layers.moe import kt_gguf_moe_mmq as MMQ
+        from sglang.srt.layers.moe import kt_lend
+
+        if getattr(self, "_mmq_blk", None) is None:
+            G, N, K = self.G, self.N, self.K
+            bufs, tails = [], []
+            with kt_lend.scratch_region():
+                for rows, cols in ((N, K), (N, K), (K, N)):
+                    rb = cols // 32 * 17
+                    tail = MMQ.tail_bytes(GGML_TYPE_MXFP4, cols)
+                    flat = torch.empty(G * rows * rb + tail, dtype=torch.uint8, device=self.device)
+                    bufs.append(flat[: G * rows * rb].view(G, rows, rb))
+                    tails.append(flat[G * rows * rb:])
+            self._mmq_blk, self._mmq_tails, self._mmq = bufs, tails, MMQ
+            _log(f"rank{self.rank} MMQ groups: block_mxfp4 buffers "
+                 f"{sum(b.numel() for b in bufs) / 1e6:.0f} MB for {G} experts")
+        for t in self._mmq_tails:
+            t.zero_()
+
+    def _mmq_regroup(self, slot, n: int):
+        """The slot's n experts into the block_mxfp4 buffers: gate and up rows, then down (rows of K); from
+        several kt-kernel parts, each part's rows lo..lo+c (gate, up) and columns lo..lo+c of its rows of m
+        (down) into this rank's rows / columns d..d+c."""
+        N, K = self.N, self.K
+        if self._seg_whole:
+            ws, sf, ss = slot.raw.shape[2], slot.raw_s.view(torch.float32), slot.raw_s.shape[2] // 4
+            for pi, (rows, cols) in enumerate(((N, K), (N, K), (K, N))):
+                _mxfp4_blocks(slot.raw[pi], ws, sf[pi], ss, self._mmq_blk[pi], n, rows, cols)
+            return
+        for (_, lo, c, d, m), raw, raw_s in zip(self._segs, slot.raws, slot.raw_ss):
+            ws, sf, ss = raw.shape[2], raw_s.view(torch.float32), raw_s.shape[2] // 4
+            for pi in (0, 1):
+                _mxfp4_blocks(raw[pi][:, lo * K // 2:], ws, sf[pi][:, lo * (K // 32):], ss,
+                              self._mmq_blk[pi][:, d:d + c], n, c, K)
+            _mxfp4_blocks(raw[2], ws, sf[2], ss, self._mmq_blk[2][:, :, d // 32 * 17:], n, K, c,
+                          in_cols=m, col_off=lo)
+
+    def _run_mmq(self, method, layer_idx: int, x, ids, topk_weights, groups, acc, stats):
+        """The layer's streamed groups through MMQ: the routes sorted by expert once (one host sync for their
+        bounds), then per group: wait for its DMA, regroup the slot into block_mxfp4 (the slot goes back to the
+        DMA at once), gate and up, the clamped SwiGLU, down, the weighted rows added into acc."""
+        self._mmq_buffers()
+        MMQ = self._mmq
+        E, topk = method.global_num_experts, ids.shape[1]
+        cur = torch.cuda.current_stream(self.device)
+        flat = ids.reshape(-1)
+        first = groups[0][0]
+        key = torch.where((flat < first) | (flat >= E), torch.full_like(flat, E), flat)
+        order = torch.argsort(key, stable=True)
+        counts = torch.bincount(key, minlength=E + 1)[:E]
+        bounds = torch.zeros(E + 1, dtype=torch.int64, device=flat.device)
+        torch.cumsum(counts, 0, out=bounds[1:])
+        e_sorted = key.index_select(0, order).to(torch.int32)
+        b32 = bounds.to(torch.int32)
+        bl = bounds.tolist()
+        lim = self.swiglu_limit_value if SWIGLU_CLAMP else None
+        self._stage_zc(layer_idx, 0, groups[0], stats)
+        for gi, experts in enumerate(groups):
+            base, n = experts[0], len(experts)
+            slot = self.slots[gi % 2]
+            lo, hi = bl[base], bl[base + n]
+            t0 = time.perf_counter()
+            if hi > lo:
+                cur.wait_event(slot.dma_done)
+                self._mmq_regroup(slot, n)
+            slot.compute_done.record(cur)
+            slot.compute_used = True
+            if gi + 1 < len(groups):
+                self._stage_zc(layer_idx, gi + 1, groups[gi + 1], stats)
+            step = MMQ_ROUTES if MMQ_ROUTES > 0 else max(1, hi - lo)
+            for r0 in range(lo, hi, step):
+                r1 = min(hi, r0 + step)
+                r = order[r0:r1]
+                t = torch.div(r, topk, rounding_mode="floor")
+                sidx = r - t * topk
+                e1 = e_sorted[r0:r1] - base
+                bb = (b32[base:base + n + 1] - r0).clamp_(0, r1 - r0)
+                xc = x.index_select(0, t)
+                gate = MMQ.moe_mmq_sorted(xc, self._mmq_blk[0][:n], e1, bb, GGML_TYPE_MXFP4, self.N).view(-1, self.N)
+                up = MMQ.moe_mmq_sorted(xc, self._mmq_blk[1][:n], e1, bb, GGML_TYPE_MXFP4, self.N).view(-1, self.N)
+                if lim is not None:
+                    gate.clamp_(max=lim)
+                    up.clamp_(-lim, lim)
+                h = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+                down = MMQ.moe_mmq_sorted(h, self._mmq_blk[2][:n], e1, bb, GGML_TYPE_MXFP4, self.K).view(-1, self.K)
+                down.mul_(topk_weights[t, sidx].to(torch.float32).unsqueeze(1))
+                acc.index_add_(0, t, down.to(acc.dtype))
+            stats["moe_enq"] += time.perf_counter() - t0
+
     def _group_body(self, layer, gi: int, base: int, n: int, xq, sf, topk_weights, ids32, acc, out):
         """Scale prep + MoE + accumulate for one group, on the current stream.
         Captured into a graph in graph mode; run eagerly otherwise."""
@@ -1365,12 +1509,14 @@ class KTStreamPrefill:
         x = dispatch_output.hidden_states
         T = x.shape[0]
         acc = torch.zeros((T, self.K), dtype=torch.bfloat16, device=x.device)
-        if self._out_full is None or self._out_full.shape[0] < T:
+        # MMQ mode: no bf16 MoE output and no CUTLASS workspace (both chunk-sized)
+        mmq_mode = MMQ and ZEROCOPY and W16 and not NOMOE
+        if not mmq_mode and (self._out_full is None or self._out_full.shape[0] < T):
             from sglang.srt.layers.moe import kt_lend
 
             with kt_lend.scratch_region():
                 self._out_full = torch.empty((T, self.K), dtype=torch.bfloat16, device=x.device)
-        self._out = self._out_full[:T]
+        self._out = None if mmq_mode else self._out_full[:T]
         # W16: the group body calls the MoE over blocks of rows
         T_call = _block_rows(T) if W16 else T
         self._tune_tokens = next_power_of_2(T_call)
@@ -1380,7 +1526,7 @@ class KTStreamPrefill:
             xq, sf = x, None
         else:
             xq, sf = mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
-        if self._workspace is None or self._workspace_tokens < T_call:
+        if not mmq_mode and (self._workspace is None or self._workspace_tokens < T_call):
             from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import _workspace_max_tokens
 
@@ -1438,6 +1584,16 @@ class KTStreamPrefill:
         ids = physical_ids.to(torch.int64)
         stats = {"write": 0.0, "hostwait": 0.0, "dma_enq": 0.0, "prep_enq": 0.0, "moe_enq": 0.0}
         t0 = time.perf_counter()
+        if mmq_mode:
+            layer_idx = method.kt_config.layer_idx
+            self._run_mmq(method, layer_idx, x, ids, topk_weights, groups, acc, stats)
+            self.calls += 1
+            if TIMING:
+                torch.cuda.current_stream(self.device).synchronize()
+                _log(f"rank{self.rank} layer{layer_idx} tokens={T} groups={len(groups)} mmq "
+                     f"dma_enq={stats['dma_enq']*1e3:.0f}ms moe_enq={stats['moe_enq']*1e3:.0f}ms "
+                     f"total={(time.perf_counter()-t0)*1e3:.0f}ms")
+            return acc
         if USE_GRAPH and not NOMOE:
             g = self._graph_inputs(T, x, physical_ids, topk_weights)
             cur = torch.cuda.current_stream(self.device)
