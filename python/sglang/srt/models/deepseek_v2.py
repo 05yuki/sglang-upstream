@@ -114,6 +114,9 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.kt_handoff_pack import (
+    SHARED_AFTER_SUBMIT as _KT_SHARED_AFTER_SUBMIT,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -1153,7 +1156,18 @@ class DeepseekV2MoE(nn.Module):
             if use_flashinfer_trtllm_bypass
             else self._maybe_quant_moe_input_once(hidden_states)
         )
-        self.alt_stream.wait_stream(current_stream)
+        # KT_SHARED_AFTER_SUBMIT: with KT experts the shared expert forks after the CPU
+        # request (event recorded by KTEPWrapperMethod.submit), so its GEMMs stop
+        # contending with the router -> top-k -> handoff chain that feeds the CPU.
+        kt_late_fork = _KT_SHARED_AFTER_SUBMIT and isinstance(
+            self.experts.quant_method, KTEPWrapperMethod
+        )
+        if kt_late_fork:
+            # today's fork point, used when this call issues no CPU request
+            kt_fork_event = current_stream.record_event()
+            self.experts.quant_method._kt_post_submit_event = None
+        else:
+            self.alt_stream.wait_stream(current_stream)
         should_quant_routed_input_mxfp8 = (
             not use_flashinfer_trtllm_bypass
             and pre_quant_input is None
@@ -1249,6 +1263,13 @@ class DeepseekV2MoE(nn.Module):
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
         # Only the quant-once fp8 pair is shared with it; the routed MXFP8 pre-quant is not.
+        if kt_late_fork:
+            kt_method = self.experts.quant_method
+            submitted = kt_method._kt_post_submit_event
+            kt_method._kt_post_submit_event = None
+            self.alt_stream.wait_event(
+                submitted if submitted is not None else kt_fork_event
+            )
         with torch.cuda.stream(self.alt_stream):
             shared_output = self._forward_shared_experts(
                 hidden_states,
