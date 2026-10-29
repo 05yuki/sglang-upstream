@@ -7,6 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
 """
 
+import inspect
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -14,6 +15,11 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.arg_groups.overrides import model_config_of
+from sglang.srt.layers.moe.kt_handoff_pack import (
+    PACK as _KT_HANDOFF_PACK,
+    SHARED_AFTER_SUBMIT as _KT_SHARED_AFTER_SUBMIT,
+    pack_to_host,
+)
 from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
@@ -447,9 +453,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # <prefix>-rank<r>.pt every 30 s. SGLang's expert distribution recorder
         # never sees the V4 router's ids (09-13); this does.
         # Submit forward task to CPU (non-blocking)
+        stream = torch.cuda.current_stream(x.device)
+        kwargs = {}
+        if _KT_HANDOFF_PACK:
+            takes_packer = getattr(self, "_kt_takes_packer", None)
+            if takes_packer is None:
+                # a kt_kernel without the packer hook keeps its copies
+                takes_packer = (
+                    "packer" in inspect.signature(self.wrapper.submit_forward).parameters
+                )
+                self._kt_takes_packer = takes_packer
+            if takes_packer:
+                # KT_HANDOFF_PACK: one kernel stages the request in the pinned buffers
+                kwargs["packer"] = pack_to_host
         self.wrapper.submit_forward(
-            x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
+            x, topk_ids, topk_weights, stream.cuda_stream, **kwargs
         )
+        if _KT_SHARED_AFTER_SUBMIT:
+            # KT_SHARED_AFTER_SUBMIT: DeepseekV2MoE forks its shared expert here
+            self._kt_post_submit_event = stream.record_event()
 
     def sync(self, x: torch.Tensor) -> torch.Tensor:
         """Synchronize and retrieve CPU expert computation results.
