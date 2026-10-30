@@ -736,8 +736,11 @@ def _arena_load(L: _Layer, e: int, dst, order: int) -> None:
     from sglang.srt.layers.moe import kt_stream_prefill
 
     st = kt_stream_prefill._instance
-    st._register_arenas(L.layer_idx)
     w13, s13, w2, s2 = (dst[k].view(torch.uint8) for k in (("w13", False), ("w13", True), ("w2", False), ("w2", True)))
+    if getattr(st, "_mxc", None) is not None:
+        _mxc_load(st, L, e, w13, s13, w2, s2, order)
+        return
+    st._register_arenas(L.layer_idx)
     if not getattr(st, "_seg_whole", True):
         _arena_load_parts(st, L, e, w13, s13, w2, s2, order)
         return
@@ -754,6 +757,47 @@ def _arena_load(L: _Layer, e: int, dst, order: int) -> None:
         c = out.numel()
         stage[:c].view(torch.uint8).copy_(src[0][e * ss:e * ss + 4 * c], non_blocking=True)
         out.view(-1).copy_(((stage[:c].view(torch.int32) >> 23) & 0xFF).to(torch.uint8))
+
+
+def _mxc_unpin_done() -> None:
+    """Gives the cache back the slots whose copies to the GPU are done."""
+    left = []
+    for moe, lid, ev in DYN.get("mxc_pins", []):
+        if ev.query():
+            moe.kt_cache_unpin(lid)
+        else:
+            left.append((moe, lid, ev))
+    DYN["mxc_pins"] = left
+
+
+def _mxc_load(st, L: _Layer, e: int, w13, s13, w2, s2, order: int) -> None:
+    """_arena_load from kt-kernel's expert cache (KT_MXFP4_EXPERT_CACHE_GIB): the slot's gate, up, down weights and
+    ue8m0 scale bytes as they are; the slot stays pinned in the cache until the copy is done. An expert the cache
+    does not hold is read from the checkpoint through the streamer's bounce (and waited for)."""
+    _mxc_unpin_done()
+    X = st._mxc
+    w = X["layers"][L.layer_idx]
+    moe, lid = w.moe, w._mxc_p2l[int(e)]
+    n = w13.shape[0] // 2
+    a, b = (0, 1) if order == 0 else (1, 0)
+    s = moe.kt_cache_pin(lid)
+    if s >= 0:
+        base, cache = s * X["sb"], X["cache"]
+        src = [cache[base + o:base + o + c] for o, c in zip(X["off"], X["nb"])]
+    else:
+        src = st._mxc_read(0, [(0, lid)], w._mxc_where)[0]
+    w13[:n].view(-1).copy_(src[a], non_blocking=True)
+    w13[n:].view(-1).copy_(src[b], non_blocking=True)
+    w2.view(-1).copy_(src[2], non_blocking=True)
+    s13[:n].view(-1).copy_(src[3 + a], non_blocking=True)
+    s13[n:].view(-1).copy_(src[3 + b], non_blocking=True)
+    s2.view(-1).copy_(src[5], non_blocking=True)
+    if s >= 0:
+        ev = torch.cuda.Event()
+        ev.record()
+        DYN.setdefault("mxc_pins", []).append((moe, lid, ev))
+    else:
+        torch.cuda.current_stream().synchronize()  # the bounce is reused by the next read
 
 
 def _arena_load_parts(st, L: _Layer, e: int, w13, s13, w2, s2, order: int) -> None:
@@ -797,7 +841,7 @@ def _dyn_setup(dev) -> None:
     L = LAYERS[0]
     roles = _roles(L)
     st = getattr(kt_stream_prefill, "_instance", None)
-    if st is None or L.layer_idx not in getattr(st, "_arenas", {}):
+    if st is None or (getattr(st, "_mxc", None) is None and L.layer_idx not in getattr(st, "_arenas", {})):
         why = "no zero-copy arenas (KT_GPU_STREAM_ZEROCOPY=1 with KT_EXPERT_SHM=1)"
     elif roles is None:
         why = f"slot tensors {[(nm, str(L.slots[nm].dtype)) for _, nm in L.names]} are not packed MXFP4 bytes"
