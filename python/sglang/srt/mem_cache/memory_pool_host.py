@@ -82,6 +82,16 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
+
+def _staging_page_capacity(num_pages: int, page_bytes: int) -> int:
+    """Write-back staging pages: at most _WRITE_BACK_STAGING_PAGE_CHUNK and at most
+    SGLANG_HICACHE_STAGING_MB of device memory (the staged kernel loops over the rest)."""
+    import os
+
+    cap = int(os.environ.get("SGLANG_HICACHE_STAGING_MB", "32")) << 20
+    return max(1, min(num_pages, _WRITE_BACK_STAGING_PAGE_CHUNK, cap // max(1, page_bytes)))
+
+
 # ---- V4 Compressed KV Host Pools ----
 
 
@@ -380,7 +390,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
             element_size=self.item_bytes * self.dtype.itemsize,
         )
-        staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        staging_page_capacity = _staging_page_capacity(
+            self.num_host_pages, self.layer_num * self.item_bytes * self.dtype.itemsize
+        )
         self.staging_buffer = torch.empty(
             (staging_page_capacity, self.layer_num, self.item_bytes),
             dtype=self.dtype,
@@ -922,7 +934,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
             element_size=self.state_page_bytes * self.dtype.itemsize,
         )
-        staging_page_capacity = min(self.num_host_pages, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        staging_page_capacity = _staging_page_capacity(
+            self.num_host_pages, self.layer_num * self.state_page_bytes * self.dtype.itemsize
+        )
         self.staging_buffer = torch.empty(
             (staging_page_capacity, self.layer_num, self.state_page_bytes),
             dtype=self.dtype,
