@@ -525,6 +525,8 @@ SWA_TOKENS = int(os.environ.get("KT_PREFILL_SWA_TOKENS", "0") or 0)
 SWA_KEEP = int(os.environ.get("KT_PREFILL_SWA_LEND_KEEP", "4096"))  # tokens kept mapped outside prefill
 SWA_MIN = int(os.environ.get("KT_PREFILL_SWA_LEND_MIN_MB", "64")) << 20  # smallest lend worth a sync
 SWA_SLACK = 1024  # tokens mapped beyond an allocation's shortfall
+# with HiCache, the trim keeps SWA_KEEP tokens outside prefill (kv-lend-hicache-swa-trim.py)
+SWA_HOST_TRIM = os.environ.get("KT_PREFILL_SWA_HOST_TRIM", "1") == "1"
 SWA = {"alloc": None, "tensors": None, "lent": None, "bytes": 0, "lends": 0, "maps": 0, "ticks": 0}
 
 
@@ -770,9 +772,29 @@ def _defer_ok() -> bool:
 
 
 def bind_tree(scheduler) -> None:
-    """kt_prefill_plan, from the scheduler: its prefix cache, for swa_trim."""
+    """kt_prefill_plan, from the scheduler: its prefix cache, for swa_trim (and its
+    HiCache controller, for _wrap_hicache_load)."""
     if SWA_ENABLED and "tree" not in SWA:
         SWA["tree"] = getattr(scheduler, "tree_cache", None)
+        _wrap_hicache_load(SWA["tree"])
+
+
+def _wrap_hicache_load(tree) -> None:
+    """A HiCache load-back allocates its SWA slots in the scheduler and starts the
+    host-to-device copy before the next forward, which is where swa_map(defer=True)
+    maps the pages it handed back: map them before the copy starts."""
+    cc = getattr(tree, "cache_controller", None)
+    if cc is None or getattr(cc, "_kt_swa_load", False) or not hasattr(cc, "start_loading"):
+        return
+    orig = cc.start_loading
+
+    def start_loading(*args, **kw):
+        swa_flush("HiCache load", quiet=SWA["maps"] > 3 and not CHECK)
+        return orig(*args, **kw)
+
+    cc.start_loading = start_loading
+    cc._kt_swa_load = True
+    _log(f"SWA lend: {type(cc).__name__}.start_loading maps the SWA pages it loads into first")
 
 
 def _swa_in_use(a) -> int:
@@ -790,6 +812,14 @@ def swa_trim(why: str) -> None:
     a, tree, budget = SWA["alloc"], SWA.get("tree"), SWA.get("budget")
     if a is None or tree is None or not budget:
         return
+    if SWA_HOST_TRIM and getattr(tree, "cache_controller", None) is not None:
+        # HiCache backs up what the cache gives back and loads it on the next match:
+        # keep only what the SWA lend keeps, the rest goes to the lends
+        if not SWA.get("host_trim_logged"):
+            SWA["host_trim_logged"] = True
+            _log(f"SWA trim: HiCache backs the cache in host memory, {SWA_KEEP} tokens kept outside prefill "
+                 f"(not the {budget}-token budget)")
+        budget = SWA_KEEP
     over = _swa_in_use(a) - budget
     if over <= 4 * SWA["ps"]:
         return
