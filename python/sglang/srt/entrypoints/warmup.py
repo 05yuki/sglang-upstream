@@ -159,3 +159,28 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+@warmup("prefill_lengths")
+async def prefill_lengths(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    """One fresh prompt of each length in SGLANG_WARMUP_PREFILL_LENGTHS (comma
+    separated), before the server reports ready: the first prefill of a
+    launch loads every kernel variant its row count selects and allocates the
+    staging a streamed prefill keeps, which otherwise lands on the first
+    request (seconds on a hybrid CPU/GPU MoE)."""
+    import os
+
+    lengths = [
+        int(x) for x in os.environ.get("SGLANG_WARMUP_PREFILL_LENGTHS", "").split(",") if x.strip()
+    ]
+    rng = np.random.default_rng(0)
+    for size in lengths:
+        logger.info("Warmup prefill of %d tokens", size)
+        generate_req_input = GenerateReqInput(
+            input_ids=rng.integers(1000, 2**16, size=[size]).tolist(),
+            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+        )
+        if disaggregation_mode != "null":
+            generate_req_input.bootstrap_room = 0
+            generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
