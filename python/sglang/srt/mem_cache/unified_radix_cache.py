@@ -1466,7 +1466,14 @@ class UnifiedRadixCache(BasePrefixCache):
             # The insert stops at page_floor(len(radix_key)), and a bigram key is
             # one shorter than the tokens it spans, so measure the key.
             for comp in self._components_tuple:
-                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+                # A later match of this key stops swa_reprefill_tail_tokens short of its
+                # end; keep the window before that point live too, or the match falls
+                # back to the previous checkpoint.
+                comp.free_out_of_window_slots(
+                    req,
+                    len(radix_key) - 1 - self.swa_reprefill_tail_tokens(req),
+                    insert_params,
+                )
 
         if effective_cache_len <= 0:
             for comp in self._components_tuple:
@@ -1625,7 +1632,14 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
             for comp in self._components_tuple:
-                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+                # A later match of this key stops swa_reprefill_tail_tokens short of its
+                # end; keep the window before that point live too, or the match falls
+                # back to the previous checkpoint.
+                comp.free_out_of_window_slots(
+                    req,
+                    len(radix_key) - 1 - self.swa_reprefill_tail_tokens(req),
+                    insert_params,
+                )
 
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
