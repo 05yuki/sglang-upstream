@@ -537,7 +537,19 @@ class FusedMoE(torch.nn.Module):
         server_args = get_server_args()
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
         if kt_config is not None:
-            if self.quant_method is not None:
+            import os
+
+            if (
+                (os.environ.get("KT_GGUF_DENSE") or os.environ.get("KT_GGUF_V41_DENSE"))
+                and kt_config.method == "LLAMAFILE"
+                and os.environ.get("KT_GGUF_HOT", "1") == "1"
+            ):
+                # the experts are a GGUF and so is the rest of the model: the
+                # hot slots hold raw GGUF blocks (kt_gguf_hot.py)
+                from sglang.srt.layers.moe.kt_gguf_hot import KTGGUFHotExpertsMethod
+
+                gpu_method = KTGGUFHotExpertsMethod(kt_config, self)
+            elif self.quant_method is not None:
                 gpu_method = self.quant_method
             elif quant_config is not None:
                 gpu_method = quant_config.get_quant_method(self, prefix)

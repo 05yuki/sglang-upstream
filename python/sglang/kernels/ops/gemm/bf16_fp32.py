@@ -134,12 +134,19 @@ def _linear_bf16_fp32_hpc(
     )
 
 
+_PRE_SM80 = bool(torch.cuda.is_available() and torch.version.hip is None and torch.cuda.get_device_capability() < (8, 0))
+
+
 def linear_bf16_fp32(
     x: torch.Tensor,
     y: torch.Tensor,
     *,
     hpc_kernel_min_m: Optional[int] = None,
 ) -> torch.Tensor:
+    if _PRE_SM80:
+        # cuBLAS has no bf16-in / fp32-out GEMM below SM80: fp32 operands (bf16 values and their
+        # products are exact in fp32; only the order of the sums differs)
+        return torch.nn.functional.linear(x.float(), y.float())
     if hpc_kernel_min_m is not None:
         output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
         if output is not None:

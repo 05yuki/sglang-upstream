@@ -772,8 +772,19 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
-        primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
+        gguf_v41 = os.environ.get("KT_GGUF_V41_DENSE")
+        if gguf_v41:
+            # DeepSeek-V4.1 dense weights from a "deepseek41" GGUF under the checkpoint's own names
+            # (patches/sglang-dsv41-gguf); --model-path only holds config.json and the tokenizer
+            from sglang.srt.layers.moe.kt_gguf_dense_v41 import gguf_v41_dense_weights
+
+            logger.info("loading the dense weights from GGUF %s", gguf_v41)
+            if self.counter_before_loading_weights == 0.0:
+                self.counter_before_loading_weights = time.perf_counter()
+            yield from gguf_v41_dense_weights(gguf_v41, model)
+        else:
+            primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
+            yield from self._get_weights_iterator(primary_weights)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())

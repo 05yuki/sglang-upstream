@@ -80,7 +80,8 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
 
 
 def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
-    if torch.cuda.get_device_capability()[0] < 8:
+    # KT_SM75_BF16=1 keeps bf16 (DSV4's JIT kernels take bf16, not fp16)
+    if torch.cuda.get_device_capability()[0] < 8 and os.environ.get("KT_SM75_BF16") != "1":
         logger.info(
             "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
         )

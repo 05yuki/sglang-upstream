@@ -1,7 +1,3 @@
-#pragma once
-
-#include "ggml-common.h"
-
 // copied from
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/vecdotq.cuh
 // copied and adapted from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/vecdotq.cuh
@@ -52,7 +48,7 @@ static __device__ __forceinline__ int get_int_from_uint8_aligned(const uint8_t* 
 template <int vdr>
 static __device__ __forceinline__ float
 vec_dot_q4_0_q8_1_impl(const int* v, const int* u, const float& d4, const half2& ds8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   int sumi = 0;
 
 #pragma unroll
@@ -78,7 +74,7 @@ vec_dot_q4_0_q8_1_impl(const int* v, const int* u, const float& d4, const half2&
 template <int vdr>
 static __device__ __forceinline__ float
 vec_dot_q4_1_q8_1_impl(const int* v, const int* u, const half2& dm4, const half2& ds8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   int sumi = 0;
 
 #pragma unroll
@@ -106,7 +102,7 @@ vec_dot_q4_1_q8_1_impl(const int* v, const int* u, const half2& dm4, const half2
 template <int vdr>
 static __device__ __forceinline__ float
 vec_dot_q5_0_q8_1_impl(const int* vl, const int* vh, const int* u, const float& d5, const half2& ds8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   int sumi = 0;
 
 #pragma unroll
@@ -139,7 +135,7 @@ vec_dot_q5_0_q8_1_impl(const int* vl, const int* vh, const int* u, const float& 
 template <int vdr>
 static __device__ __forceinline__ float
 vec_dot_q5_1_q8_1_impl(const int* vl, const int* vh, const int* u, const half2& dm5, const half2& ds8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   int sumi = 0;
 
 #pragma unroll
@@ -174,7 +170,7 @@ vec_dot_q5_1_q8_1_impl(const int* vl, const int* vh, const int* u, const half2& 
 template <int vdr>
 static __device__ __forceinline__ float
 vec_dot_q8_0_q8_1_impl(const int* v, const int* u, const float& d8_0, const float& d8_1) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   int sumi = 0;
 
 #pragma unroll
@@ -189,7 +185,7 @@ vec_dot_q8_0_q8_1_impl(const int* v, const int* u, const float& d8_0, const floa
 template <int vdr>
 static __device__ __forceinline__ float
 vec_dot_q8_1_q8_1_impl(const int* v, const int* u, const half2& dm8, const half2& ds8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
 
   int sumi = 0;
 
@@ -218,7 +214,7 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
     const uint8_t* __restrict__ scales,
     const half2& dm2,
     const float* __restrict__ d8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   float sumf_d = 0.0f;
   float sumf_m = 0.0f;
 
@@ -249,7 +245,7 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
     const uint8_t* __restrict__ scales,
     const half2& dm2,
     const float& d8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   int sumi_d = 0;
   int sumi_m = 0;
 
@@ -291,7 +287,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
     const int& scale_offset,
     const float& d3,
     const float* __restrict__ d8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
 
   float sumf = 0.0f;
 
@@ -328,7 +324,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
     const int8_t* __restrict__ scales,
     const float& d3,
     const float& d8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   int sumi = 0;
 
 #pragma unroll
@@ -357,7 +353,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
     const uint8_t* __restrict__ m,
     const half2& dm4,
     const float* __restrict__ d8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
 
   float sumf_d = 0.0f;
   float sumf_m = 0.0f;
@@ -386,7 +382,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
     const uint8_t* __restrict__ m,
     const half2& dm4,
     const half2* __restrict__ ds8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   float sumf_d = 0.0f;
   float sumf_m = 0.0f;
 
@@ -422,7 +418,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
     const uint8_t* __restrict__ m,
     const half2& dm5,
     const float* __restrict__ d8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
 
   float sumf_d = 0.0f;
   float sumf_m = 0.0f;
@@ -457,7 +453,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
     const uint8_t* __restrict__ m,
     const half2& dm4,
     const half2* __restrict__ ds8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   float sumf_d = 0.0f;
   float sumf_m = 0.0f;
 
@@ -493,7 +489,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     const int8_t* __restrict__ scales,
     const float& d,
     const float* __restrict__ d8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   float sumf = 0.0f;
 
 #pragma unroll
@@ -516,7 +512,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
     const int8_t* __restrict__ sc,
     const float& d6,
     const float* __restrict__ d8) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   float sumf_d = 0.0f;
 
 #pragma unroll
@@ -1811,7 +1807,7 @@ vec_dot_iq2_xs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
 
 static __device__ __forceinline__ float
 vec_dot_iq2_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   const block_iq2_s* bq2 = (const block_iq2_s*)vbq;
 
   const int ib32 = iqs;
@@ -1850,7 +1846,7 @@ vec_dot_iq2_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ 
 
 static __device__ __forceinline__ float
 vec_dot_iq3_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   const block_iq3_xxs* bq2 = (const block_iq3_xxs*)vbq;
 
   const int ib32 = iqs;
@@ -1877,7 +1873,7 @@ vec_dot_iq3_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict_
 
 static __device__ __forceinline__ float
 vec_dot_iq3_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   const block_iq3_s* bq2 = (const block_iq3_s*)vbq;
 
   const int ib32 = iqs;
@@ -1885,8 +1881,8 @@ vec_dot_iq3_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ 
   const int8_t* q8 = bq8_1[ib32].qs;
   int sumi = 0;
   for (int l = 0; l < 4; ++l) {
-    const uint32_t* grid1 = iq3xs_grid + (qs[2 * l + 0] | ((bq2->qh[ib32] << (8 - 2 * l)) & 256));
-    const uint32_t* grid2 = iq3xs_grid + (qs[2 * l + 1] | ((bq2->qh[ib32] << (7 - 2 * l)) & 256));
+    const uint32_t* grid1 = iq3s_grid + (qs[2 * l + 0] | ((bq2->qh[ib32] << (8 - 2 * l)) & 256));
+    const uint32_t* grid2 = iq3s_grid + (qs[2 * l + 1] | ((bq2->qh[ib32] << (7 - 2 * l)) & 256));
     uint32_t signs0 = __vcmpeq4(((bq2->signs[4 * ib32 + l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
     uint32_t signs1 = __vcmpeq4(((bq2->signs[4 * ib32 + l] >> 4) * 0x01010101) & 0x08040201, 0x08040201);
     const int grid_l = __vsub4(grid1[0] ^ signs0, signs0);
@@ -1895,15 +1891,17 @@ vec_dot_iq3_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ 
     sumi = __dp4a(grid_h, *((int*)q8 + 1), sumi);
     q8 += 8;
   }
-  const float d = __half2float(bq2->d) * (0.5f + ((bq2->scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf)) *
-                  __low2float(bq8_1[ib32].ds) * 0.5f;
+  // ggml's IQ3_S: grid iq3s_grid, block scale d * (1 + 2 * s) (the old iq3xs_grid / (0.5 + s) * 0.5
+  // pair is a pre-release format)
+  const float d = __half2float(bq2->d) * (1 + 2 * ((bq2->scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf)) *
+                  __low2float(bq8_1[ib32].ds);
   return d * sumi;
 #endif
 }
 
 static __device__ __forceinline__ float
 vec_dot_iq1_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   const block_iq1_s* bq1 = (const block_iq1_s*)vbq;
 
   const int qs_packed = get_int_b2(bq1->qs, iqs);
@@ -1935,7 +1933,7 @@ vec_dot_iq1_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ 
 
 static __device__ __forceinline__ float
 vec_dot_iq1_m_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
 
   const block_iq1_m* bq1 = (const block_iq1_m*)vbq;
 
@@ -1995,7 +1993,7 @@ get_int_from_table_16(const uint32_t& q4, const uint8_t* values, int& val1, int&
 
 static __device__ __forceinline__ float
 vec_dot_iq4_nl_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
 
   const block_iq4_nl* bq = (const block_iq4_nl*)vbq;
 
@@ -2019,7 +2017,7 @@ vec_dot_iq4_nl_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__
 
 static __device__ __forceinline__ float
 vec_dot_iq4_xs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM || defined USE_MUSA
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
   const block_iq4_xs* bq4 = (const block_iq4_xs*)vbq;
   const uint8_t* values = (const uint8_t*)kvalues_iq4nl;
 

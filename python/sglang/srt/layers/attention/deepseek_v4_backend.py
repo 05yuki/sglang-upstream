@@ -255,7 +255,8 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 def _use_sm89_sparse_attention() -> bool:
     # Ada has BF16 tensor cores, but cannot run FlashMLA's SM90+ kernels.
     # Match the runtime platform exactly; native SM90/SM100/SM120 paths stay intact.
-    return _is_cuda and get_platform().device_capability == (8, 9)
+    # Turing too (the Triton kernels open FP8 and dot in fp32 there)
+    return _is_cuda and get_platform().device_capability in ((8, 9), (7, 5))
 
 
 def _create_flashmla_metadata():

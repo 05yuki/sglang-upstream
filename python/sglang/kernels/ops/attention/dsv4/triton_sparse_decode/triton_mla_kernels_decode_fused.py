@@ -23,6 +23,33 @@ from sglang.srt.utils.common import is_gfx942_supported
 # gfx950/MI350 and CUDA store OCP e4m3fn (bias 7).
 _KV_FP8_TY = tl.float8e4b8 if is_gfx942_supported() else tl.float8e4nv
 
+# below SM80 Triton has no FP8 type and no bf16 dot
+_PRE_SM80 = tl.constexpr(bool(torch.cuda.is_available() and torch.version.hip is None and torch.cuda.get_device_capability() < (8, 0)))
+
+
+@triton.jit
+def _kv_fp8(x_u8):
+    """e4m3 bytes as values: the FP8 type, or below SM80 float32 built from the bit fields (e4m3fn; no NaN bytes
+    are written)."""
+    if _PRE_SM80:
+        x = x_u8.to(tl.int32)
+        e = (x >> 3) & 0xF
+        m = x & 7
+        normal = (((x >> 7) << 31) | ((e + 120) << 23) | (m << 20)).to(tl.float32, bitcast=True)
+        sub = m.to(tl.float32) * 0.001953125
+        sub = tl.where((x >> 7) != 0, -sub, sub)
+        return tl.where(e == 0, sub, normal)
+    else:
+        return x_u8.to(_KV_FP8_TY, bitcast=True)
+
+
+@triton.jit
+def _kdot(a, b):
+    if _PRE_SM80:
+        return tl.dot(a.to(tl.float32), b.to(tl.float32), input_precision="ieee")
+    else:
+        return tl.dot(a, b)
+
 
 def _bucket_total_tokens(total_tokens: int) -> int:
     """Round total_tokens up to the nearest power of 2 for autotune key stability."""
@@ -219,44 +246,44 @@ def _process_kv_block_aggressive(
 
     qk = tl.zeros([BLOCK_H, BLOCK_N], dtype=tl.float32)
 
-    nope_fp8_0 = nope_uint8_0.to(_KV_FP8_TY, bitcast=True)
+    nope_fp8_0 = _kv_fp8(nope_uint8_0)
     kv_0 = (nope_fp8_0.to(tl.bfloat16) * scale_bf16_0[:, None]).to(tl.bfloat16)
     kv_0 = tl.where(valid_2d, kv_0, 0.0)
-    qk += tl.dot(q_0, tl.trans(kv_0)).to(tl.float32)
+    qk += _kdot(q_0, tl.trans(kv_0)).to(tl.float32)
 
-    nope_fp8_1 = nope_uint8_1.to(_KV_FP8_TY, bitcast=True)
+    nope_fp8_1 = _kv_fp8(nope_uint8_1)
     kv_1 = (nope_fp8_1.to(tl.bfloat16) * scale_bf16_1[:, None]).to(tl.bfloat16)
     kv_1 = tl.where(valid_2d, kv_1, 0.0)
-    qk += tl.dot(q_1, tl.trans(kv_1)).to(tl.float32)
+    qk += _kdot(q_1, tl.trans(kv_1)).to(tl.float32)
 
-    nope_fp8_2 = nope_uint8_2.to(_KV_FP8_TY, bitcast=True)
+    nope_fp8_2 = _kv_fp8(nope_uint8_2)
     kv_2 = (nope_fp8_2.to(tl.bfloat16) * scale_bf16_2[:, None]).to(tl.bfloat16)
     kv_2 = tl.where(valid_2d, kv_2, 0.0)
-    qk += tl.dot(q_2, tl.trans(kv_2)).to(tl.float32)
+    qk += _kdot(q_2, tl.trans(kv_2)).to(tl.float32)
 
-    nope_fp8_3 = nope_uint8_3.to(_KV_FP8_TY, bitcast=True)
+    nope_fp8_3 = _kv_fp8(nope_uint8_3)
     kv_3 = (nope_fp8_3.to(tl.bfloat16) * scale_bf16_3[:, None]).to(tl.bfloat16)
     kv_3 = tl.where(valid_2d, kv_3, 0.0)
-    qk += tl.dot(q_3, tl.trans(kv_3)).to(tl.float32)
+    qk += _kdot(q_3, tl.trans(kv_3)).to(tl.float32)
 
-    nope_fp8_4 = nope_uint8_4.to(_KV_FP8_TY, bitcast=True)
+    nope_fp8_4 = _kv_fp8(nope_uint8_4)
     kv_4 = (nope_fp8_4.to(tl.bfloat16) * scale_bf16_4[:, None]).to(tl.bfloat16)
     kv_4 = tl.where(valid_2d, kv_4, 0.0)
-    qk += tl.dot(q_4, tl.trans(kv_4)).to(tl.float32)
+    qk += _kdot(q_4, tl.trans(kv_4)).to(tl.float32)
 
-    nope_fp8_5 = nope_uint8_5.to(_KV_FP8_TY, bitcast=True)
+    nope_fp8_5 = _kv_fp8(nope_uint8_5)
     kv_5 = (nope_fp8_5.to(tl.bfloat16) * scale_bf16_5[:, None]).to(tl.bfloat16)
     kv_5 = tl.where(valid_2d, kv_5, 0.0)
-    qk += tl.dot(q_5, tl.trans(kv_5)).to(tl.float32)
+    qk += _kdot(q_5, tl.trans(kv_5)).to(tl.float32)
 
-    nope_fp8_6 = nope_uint8_6.to(_KV_FP8_TY, bitcast=True)
+    nope_fp8_6 = _kv_fp8(nope_uint8_6)
     kv_6 = (nope_fp8_6.to(tl.bfloat16) * scale_bf16_6[:, None]).to(tl.bfloat16)
     kv_6 = tl.where(valid_2d, kv_6, 0.0)
-    qk += tl.dot(q_6, tl.trans(kv_6)).to(tl.float32)
+    qk += _kdot(q_6, tl.trans(kv_6)).to(tl.float32)
 
     kv_7 = (rope_lo | (rope_hi << 8)).to(tl.bfloat16, bitcast=True)
     kv_7 = tl.where(valid_2d, kv_7, 0.0)
-    qk += tl.dot(q_7, tl.trans(kv_7)).to(tl.float32)
+    qk += _kdot(q_7, tl.trans(kv_7)).to(tl.float32)
 
     qk = qk * sm_scale
     qk = tl.where(valid[None, :], qk, NEG_INF)
@@ -268,14 +295,14 @@ def _process_kv_block_aggressive(
     l_new = alpha * l_i + tl.sum(p, axis=1)
     p_bf16 = p.to(tl.bfloat16)
 
-    acc_0 = acc_0 * alpha[:, None] + tl.dot(p_bf16, kv_0).to(tl.float32)
-    acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, kv_1).to(tl.float32)
-    acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, kv_2).to(tl.float32)
-    acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, kv_3).to(tl.float32)
-    acc_4 = acc_4 * alpha[:, None] + tl.dot(p_bf16, kv_4).to(tl.float32)
-    acc_5 = acc_5 * alpha[:, None] + tl.dot(p_bf16, kv_5).to(tl.float32)
-    acc_6 = acc_6 * alpha[:, None] + tl.dot(p_bf16, kv_6).to(tl.float32)
-    acc_7 = acc_7 * alpha[:, None] + tl.dot(p_bf16, kv_7).to(tl.float32)
+    acc_0 = acc_0 * alpha[:, None] + _kdot(p_bf16, kv_0).to(tl.float32)
+    acc_1 = acc_1 * alpha[:, None] + _kdot(p_bf16, kv_1).to(tl.float32)
+    acc_2 = acc_2 * alpha[:, None] + _kdot(p_bf16, kv_2).to(tl.float32)
+    acc_3 = acc_3 * alpha[:, None] + _kdot(p_bf16, kv_3).to(tl.float32)
+    acc_4 = acc_4 * alpha[:, None] + _kdot(p_bf16, kv_4).to(tl.float32)
+    acc_5 = acc_5 * alpha[:, None] + _kdot(p_bf16, kv_5).to(tl.float32)
+    acc_6 = acc_6 * alpha[:, None] + _kdot(p_bf16, kv_6).to(tl.float32)
+    acc_7 = acc_7 * alpha[:, None] + _kdot(p_bf16, kv_7).to(tl.float32)
 
     return acc_0, acc_1, acc_2, acc_3, acc_4, acc_5, acc_6, acc_7, m_new, l_new
 

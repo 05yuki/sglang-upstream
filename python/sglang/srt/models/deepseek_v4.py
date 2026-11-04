@@ -699,6 +699,56 @@ _FREQS_CIS_TO_COS_SIN: dict[
 ] = {}
 
 
+_SERVED_ROWS = {}
+# a GGUF pack (KT_GGUF_V41_DENSE): its own RoPE rows; the MXFP4 checkpoint keeps upstream's
+# tables and SGLANG_DSV4_ROPE_LAZY (layers/lazy_rope_table.py)
+_GGUF_ROPE = bool(__import__("os").environ.get("KT_GGUF_V41_DENSE"))
+_ROPE_DEVICE_ROWS = int(__import__("os").environ.get("KT_ROPE_DEVICE_ROWS", "131072") or 0)
+
+
+def _rope_rows_split(table: torch.Tensor) -> torch.Tensor:
+    """A per-position table longer than KT_ROPE_DEVICE_ROWS rows (0: all on the GPU): its first
+    rows on the GPU and the rest in host memory of the GPU's NUMA node, one range the kernels
+    address as before (kv_vmm, as the host KV). The same values; positions past the GPU part
+    are read over PCIe."""
+    n = table.shape[0]
+    if not _GGUF_ROPE or _ROPE_DEVICE_ROWS <= 0 or n <= _ROPE_DEVICE_ROWS or not table.is_cuda or not table.is_contiguous():
+        return table
+    try:
+        from sglang.srt.layers.moe import kt_kv_vmm
+        from sglang.srt.mem_cache.dsv41_host_kv import _gpu_numa_node
+    except ImportError:  # without tier 1's kv-vmm and host-kv: the table stays on the GPU
+        return table
+    if not kt_kv_vmm.ENABLED:
+        return table
+
+    index = table.device.index
+    row = table.nbytes // n
+    out = kt_kv_vmm.split_tensor(table.shape, table.dtype, index, _ROPE_DEVICE_ROWS * row, _gpu_numa_node(index))
+    out.copy_(table)
+    logger.info("RoPE table %s %s: %d of %d rows on the GPU (%d MiB), the rest in host memory",
+                tuple(table.shape), table.dtype, _ROPE_DEVICE_ROWS, n, _ROPE_DEVICE_ROWS * row >> 20)
+    return out
+
+
+def _served_rows(table: torch.Tensor, key) -> torch.Tensor:
+    """The first context_length rows of a per-position table, or the whole table when the
+    served context is not known or not shorter; one copy for the layers that share a table
+    either way (the table comes from precompute_freqs_cis.__wrapped__, which caches nothing)."""
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        n = int(get_server_args().context_length or 0)
+    except Exception:
+        n = 0
+    if n <= 0 or n >= table.shape[0]:
+        n = table.shape[0]
+    key = (key, n)
+    if key not in _SERVED_ROWS:
+        _SERVED_ROWS[key] = _rope_rows_split(table) if n == table.shape[0] else table[:n].clone()
+    return _SERVED_ROWS[key]
+
+
 def _freqs_cis_to_cos_sin(
     freqs_cis: torch.Tensor, dtype: torch.dtype, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -710,8 +760,8 @@ def _freqs_cis_to_cos_sin(
     if cached is not None:
         return cached
     fr = torch.view_as_real(freqs_cis)
-    cos = fr[..., 0].to(device=device, dtype=dtype).contiguous()
-    sin = fr[..., 1].to(device=device, dtype=dtype).contiguous()
+    cos = _rope_rows_split(fr[..., 0].to(device=device, dtype=dtype).contiguous())
+    sin = _rope_rows_split(fr[..., 1].to(device=device, dtype=dtype).contiguous())
     _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
     return cos, sin
 
@@ -738,6 +788,23 @@ def _fp8_wo_a_einsum(
     return out
 
 
+_WO_A_DEQUANT_ROWS = int(__import__("os").environ.get("SGLANG_DSV4_WO_A_DEQUANT_ROWS", "64") or 0)
+
+
+_WO_A_MOE_VEC = __import__("os").environ.get("SGLANG_DSV4_WO_A_MOE_VEC", "1") == "1"
+_WO_A_MOE_VEC_TYPES = {2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30}  # sgl_kernel's MMVQ types
+_WO_A_IDS: dict = {}
+
+
+def _wo_a_group_ids(G: int, M: int, device) -> torch.Tensor:
+    """[M * G, 1] int32: token m*G+g picks expert g (kept per (G, M, device); captured decode graphs reuse it)."""
+    key = (G, M, device)
+    t = _WO_A_IDS.get(key)
+    if t is None:
+        t = _WO_A_IDS[key] = torch.arange(G, dtype=torch.int32, device=device).repeat(M).view(M * G, 1)
+    return t
+
+
 def _apply_gguf_grouped_wo_a(
     o: torch.Tensor,
     qweight: torch.Tensor,
@@ -749,6 +816,44 @@ def _apply_gguf_grouped_wo_a(
         from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
 
         matmul_fn = fused_mul_mat_gguf
+        # prefill-sized batches on llama.cpp's MMQ, one group at a time (its q8_1 buffer is one group's
+        # activations, sliced by rows; the weight stays in its GGUF blocks)
+        from sglang.srt.layers.quantization import gguf as _gguf
+
+        if (
+            _gguf._MMQ_ON
+            and o.shape[0] >= _gguf._MMQ_ROWS
+            and qweight_type in _gguf.MMQ_PREFILL_TYPES
+            and o.stride(2) == 1
+            and _gguf._mmq_weight_ok(qweight, qweight_type)
+        ):
+            M, G, _ = o.shape
+            out = torch.empty(M, G, o_lora_rank, dtype=o.dtype, device=o.device)
+            for g in range(G):
+                _gguf.mmq_mul_mat(
+                    o[:, g, :], qweight[g * o_lora_rank : (g + 1) * o_lora_rank], qweight_type, out[:, g, :]
+                )
+            return out
+        # otherwise prefill-sized batches dequantize the layer's rows once and run one
+        # batched bf16 GEMM (sgl_kernel's a8 MMQ a head took 72% of a 27K prefill's GPU time, 10-25)
+        if o.shape[0] >= _WO_A_DEQUANT_ROWS:
+            from sglang.srt.layers.quantization.gguf import dequantize_gguf_weight
+
+            w = dequantize_gguf_weight(qweight, qweight_type, o.dtype)
+            w = w.view(o.shape[1], o_lora_rank, w.shape[-1])
+            return torch.bmm(o.transpose(0, 1), w.transpose(1, 2)).transpose(0, 1).contiguous()
+        # every head in one MoE-vector launch (one MMVQ a head was 521 launches a token)
+        if _WO_A_MOE_VEC and qweight_type in _WO_A_MOE_VEC_TYPES:
+            from sgl_kernel import ggml_moe_a8_vec
+
+            M, G, K_in = o.shape
+            x = o.reshape(M * G, K_in)
+            if x.stride(1) != 1:
+                x = x.contiguous()
+            ids = _wo_a_group_ids(G, M, o.device)
+            w = qweight.view(G, o_lora_rank, qweight.shape[-1])
+            y = ggml_moe_a8_vec(x, w, ids, 1, qweight_type, o_lora_rank, M * G)
+            return y.view(M, G, o_lora_rank)
 
     group_outputs = []
     for group_id in range(o.shape[1]):
@@ -1085,7 +1190,7 @@ class MqaAttentionBase(nn.Module):
         quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
         if wo_a_keeps_quant_config is None:
             keep_source_quant = (
-                quant_config is not None and quant_config.get_name() == "expert_pack"
+                quant_config is not None and quant_config.get_name() in ("expert_pack", "gguf")
             )
             wo_a_quant_config: Optional[QuantizationConfig] = (
                 quant_config if quantize_wo_a or keep_source_quant else None
@@ -1205,7 +1310,13 @@ class MqaAttentionBase(nn.Module):
             beta_fast=scaling.get("beta_fast", 32),
             beta_slow=scaling.get("beta_slow", 1),
         )
-        freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
+        if _GGUF_ROPE:
+            # the cached full table is not kept
+            freqs_cis = _served_rows(
+                precompute_freqs_cis.__wrapped__(**self.rope_kwargs), ("freqs_cis", tuple(sorted(self.rope_kwargs.items())))
+            )
+        else:
+            freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
@@ -1410,6 +1521,9 @@ class MQALayer(MqaAttentionBase):
             is_neox_style=False,
             device=get_device().device,
         )
+        if _GGUF_ROPE and isinstance(getattr(self.rotary_emb, "cos_sin_cache", None), torch.Tensor):
+            # the served context's rows only, as freqs_cis
+            self.rotary_emb.cos_sin_cache = _served_rows(self.rotary_emb.cos_sin_cache, ("cos_sin", id(self.rotary_emb)))
 
         if _is_npu:
             rope = Dsv4NpuRoPE.for_freqs(
@@ -3815,7 +3929,7 @@ class DeepseekV4Model(nn.Module):
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
                 quant_config
-                if quant_config is not None and quant_config.get_name() == "expert_pack"
+                if quant_config is not None and quant_config.get_name() in ("expert_pack", "gguf")
                 else None
             )
             self.embed_tokens = VocabParallelEmbedding(

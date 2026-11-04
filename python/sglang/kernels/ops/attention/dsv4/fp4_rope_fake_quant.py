@@ -11,6 +11,20 @@ from triton.language.extra import libdevice
 
 from sglang.kernels.ops.quantization.fp4_fake_quant import FP4_AMAX_FLOOR
 
+# Triton has no e4m3 type below SM89
+_PRE_SM89 = tl.constexpr(bool(torch.cuda.is_available() and torch.version.hip is None and torch.cuda.get_device_capability() < (8, 9)))
+
+
+@triton.jit
+def _round_e4m3(x):
+    """A positive float32 in [2^-9, 448] rounded to the nearest e4m3 value (ties to even), as a float32."""
+    if _PRE_SM89:
+        e = tl.maximum(((x.to(tl.int32, bitcast=True) >> 23) & 0xFF) - 127, -6)
+        q = ((e + 124) << 23).to(tl.float32, bitcast=True)  # 2^(e - 3), the e4m3 spacing at x
+        return tl.minimum(libdevice.rint(x / q) * q, 448.0)
+    else:
+        return x.to(tl.float8e4nv).to(tl.float32)
+
 
 @triton.jit
 def rope_tail_fake_quant_fp4_row(
@@ -54,7 +68,7 @@ def rope_tail_fake_quant_fp4_row(
     amax = tl.max(tl.abs(vb), axis=1)
     if COMPRESSED_KV:
         scale = tl.minimum(tl.maximum(amax * (1.0 / 6.0), 2.0**-9), 448.0)
-        scale = scale.to(tl.float8e4nv).to(tl.float32)
+        scale = _round_e4m3(scale)
         s = tl.div_rn(vb, scale[:, None])
     else:
         amax = tl.maximum(amax, AMAX_FLOOR) * (1.0 / 6.0)
