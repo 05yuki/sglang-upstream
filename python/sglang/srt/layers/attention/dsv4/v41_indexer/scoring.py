@@ -18,6 +18,11 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+from sglang.kernels.ops.attention.dsv4.live_topk import (
+    live_decode_slots,
+    live_topk_enabled,
+    live_topk_full,
+)
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
@@ -391,6 +396,8 @@ class DecodeScores(msgspec.Struct, frozen=True):
     lens: torch.Tensor  # [bs]
     slots: torch.Tensor  # [bs, lmax]
     scores: torch.Tensor  # [bs, lmax]
+    # KT_IDX_LIVE_TOPK: slots hold [0, lens) only; select with the live kernels
+    live: bool = False
 
 
 def prefill_requests(
@@ -571,14 +578,22 @@ def decode_scores(
             has_candidate_mask=candidate_mask is not None,
         )
     inputs.reset_outputs()
-    j = torch.arange(lmax, device=pos.device)
-    valid = j[None, :] < lens[:, None]
-    slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
-    slots = slots.masked_fill(~valid, 0)
+    # KT_IDX_LIVE_TOPK: the live positions' slots in one kernel (capacity-sized grid,
+    # early exit past the device-side length); the logits kernel reads no further.
+    live = live_topk_enabled(lmax, pos.device)
+    if live:
+        slots = live_decode_slots(req_to_token, req, lens, ratio, lmax)
+    else:
+        j = torch.arange(lmax, device=pos.device)
+        valid = j[None, :] < lens[:, None]
+        slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
+        slots = slots.masked_fill(~valid, 0)
     scores = fp4_index_logits_decode(
         q, weights, slots, lens, table, table.shape[1] // 68
     )
-    return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
+    return DecodeScores(
+        bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores, live=live
+    )
 
 
 def select_decode(
@@ -600,6 +615,9 @@ def select_decode(
             d.ratio,
             d.has_candidate_mask,
         )
+    elif d.live:
+        # same picks, order and slots as the topk + sort + gather below
+        live_topk_full(d.scores, d.slots, d.lens, k, inputs.out_page_indices[: d.bs])
     else:
         write_decode(inputs, d, d.scores.topk(k, dim=-1, sorted=False).indices)
 

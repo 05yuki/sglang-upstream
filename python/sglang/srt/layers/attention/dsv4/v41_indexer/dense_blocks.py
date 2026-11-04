@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     topk_among_blocks,
 )
 from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
+from sglang.kernels.ops.attention.dsv4.live_topk import live_topk_among_blocks
 
 from .scoring import (
     DeepGEMMPrefillData,
@@ -137,6 +138,18 @@ class DenseBlocksBackend:
             select_decode(inputs, d, inputs.indexer.index_topk)
             return
         k = min(inputs.indexer.index_topk, d.lmax)
+        if d.live:
+            # KT_IDX_LIVE_TOPK: ties ranked in the published block order, as below
+            live_topk_among_blocks(
+                d.scores,
+                d.slots,
+                d.lens,
+                published.blocks,
+                k,
+                self.block_size,
+                inputs.out_page_indices[: d.bs],
+            )
+            return
         idx = topk_among_blocks(
             d.scores, d.lens, published.blocks, k, block_size=self.block_size
         )
