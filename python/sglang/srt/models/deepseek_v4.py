@@ -602,6 +602,19 @@ def _vision_offload(model) -> None:
         pass
 
 
+def _rope_lazy(model) -> None:
+    """SGLANG_DSV4_ROPE_LAZY=1: the freqs_cis tables mapped as the context grows
+    (layers/lazy_rope_table.py); 0.54 GB a GPU at 1M until a context needs them."""
+    from sglang.srt.layers import lazy_rope_table
+
+    nbytes = lazy_rope_table.install(model)
+    if nbytes:
+        logger.info(
+            "RoPE tables mapped as the context grows: %.1f MiB no longer resident",
+            nbytes / 2**20,
+        )
+
+
 @contextmanager
 def _vision_on_gpu(model):
     """Around an image batch: the tower's parameters back on the GPU, freed after."""
@@ -1712,14 +1725,21 @@ class MQALayer(MqaAttentionBase):
         if self.compress_ratio:
             active_rope_scaling = dict(self.rope_scaling or {})
             active_rope_scaling["rope_type"] = "deepseek_yarn"
-        self.rotary_emb = get_rope_wrapper(
-            head_size=self.rope_head_dim,
-            rotary_dim=self.rope_head_dim,
-            max_position=config.max_position_embeddings,
-            base=self.rope_base,
-            rope_scaling=active_rope_scaling,
-            is_neox_style=False,
-            device=get_device().device,
+        # On CUDA nothing reads rotary_emb: the compressor and the C4 indexer keep it unused, and
+        # the cos/sin consumers are the NPU and ROCm paths. Its fp32 cos/sin cache over the full
+        # max_position_embeddings (two RoPE bases: 0.54 GB a GPU at 1M) is not built there.
+        self.rotary_emb = (
+            None
+            if _is_cuda
+            else get_rope_wrapper(
+                head_size=self.rope_head_dim,
+                rotary_dim=self.rope_head_dim,
+                max_position=config.max_position_embeddings,
+                base=self.rope_base,
+                rope_scaling=active_rope_scaling,
+                is_neox_style=False,
+                device=get_device().device,
+            )
         )
         if _GGUF_ROPE and isinstance(getattr(self.rotary_emb, "cos_sin_cache", None), torch.Tensor):
             # the served context's rows only, as freqs_cis
@@ -5505,6 +5525,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if not is_nextn:
             _vision_offload(self)
+            _rope_lazy(self)
             _setup_wo_a_native(self)
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
