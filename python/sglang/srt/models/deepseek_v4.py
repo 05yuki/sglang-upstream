@@ -600,6 +600,20 @@ def _vision_offload(model) -> None:
         pass
 
 
+def _embed_offload(model) -> None:
+    """SGLANG_DSV4_EMBED_ON_HOST=1: the token embedding read from pinned host memory
+    (layers/host_embedding.py); its VRAM (1.32 GB on one GPU, half that on two) is freed."""
+    if os.environ.get("SGLANG_DSV4_EMBED_ON_HOST", "0") != "1":
+        return
+    embed = getattr(getattr(model, "model", None), "embed_tokens", None)
+    if embed is None or not hasattr(embed, "shard_indices"):
+        return
+    from sglang.srt.layers.host_embedding import move_embedding_to_host
+
+    nbytes = move_embedding_to_host(embed)
+    logger.info("token embedding on host: %.1f MiB moved to pinned host memory", nbytes / 2**20)
+
+
 def _rope_lazy(model) -> None:
     """SGLANG_DSV4_ROPE_LAZY=1: the freqs_cis tables mapped as the context grows
     (layers/lazy_rope_table.py); 0.54 GB a GPU at 1M until a context needs them."""
@@ -5369,6 +5383,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if not is_nextn:
             _vision_offload(self)
+            _embed_offload(self)
             _rope_lazy(self)
             _setup_wo_a_native(self)
         if self.wo_a_fp8:
