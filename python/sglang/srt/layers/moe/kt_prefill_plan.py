@@ -36,6 +36,10 @@ CARRY = int(float(_cost[3]) * (1 << 20)) if len(_cost) >= 4 else 0
 LIVE = os.environ.get("KT_PREFILL_PLAN_LIVE", "1") == "1"
 DELTA = int(os.environ.get("KT_PREFILL_PLAN_DELTA_MB", "0") or 0) << 20
 ALIGN = int(os.environ.get("KT_PREFILL_PLAN_ALIGN", "1024"))
+# a GGUF pack (KT_GGUF_V41_DENSE) only: the chunks may run TAIL_STEPS aligned steps over the
+# launch chunk, and the free memory is read without torch's cached blocks
+_GGUF = bool(os.environ.get("KT_GGUF_V41_DENSE"))
+TAIL_STEPS = int(os.environ.get("KT_PREFILL_PLAN_TAIL_STEPS", "2" if _GGUF else "0"))
 # the chunk this setup is known to take without a plan (the lend's hint): what a
 # request gets while there is no free-memory step to plan with (the first window
 # of a launch without KT_PREFILL_PLAN_DELTA_MB); unset, the launch chunk
@@ -135,6 +139,10 @@ def _free_now(scheduler) -> int:
         # buffers grown to a larger chunk: 131K planned at 13,312 rows ran out)
         mine = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
     elif delta is not None:
+        # the blocks a decode left in torch's cache go back at the window's start (its empty_cache):
+        # measured without them, as the step was
+        if _GGUF:
+            torch.cuda.empty_cache()
         mine = torch.cuda.mem_get_info()[0] + delta
     else:
         mine = -1
@@ -226,11 +234,23 @@ def chunk_for(scheduler, chunk: int) -> int:
 
     # the fewest chunks whose equal size, in whole ALIGN steps, fits (the step
     # rounds a chunk up: 35,000 in three is 11,667 rows, 12,288 once aligned)
+    # over the launch chunk by up to TAIL_STEPS aligned steps when that spares a chunk (a
+    # chunk of the streamed prefill sweeps every expert once; a tail chunk pays the same)
+    slack = chunk + ALIGN * TAIL_STEPS
     for n in range(1, 257):
         c = math.ceil(rem / n)
-        c = min(chunk, max(ALIGN, -(-c // ALIGN) * ALIGN))
+        c = max(ALIGN, -(-c // ALIGN) * ALIGN)
+        if not TAIL_STEPS:
+            c = min(chunk, c)
+        elif c > slack:
+            continue
+        elif c > chunk and math.ceil(rem / chunk) <= n:
+            c = chunk  # over the launch chunk without sparing a chunk: the launch chunk
         if fits(c, n) or c <= ALIGN:
             break
+    else:
+        if TAIL_STEPS:
+            c = min(chunk, ALIGN)
     n = max(1, math.ceil(rem / c))  # the launch chunk may cap it (V4.1's SWA pool)
     if len(NEED) > 4096:
         NEED.clear()

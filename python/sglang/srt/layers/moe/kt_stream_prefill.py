@@ -1996,8 +1996,19 @@ def hot_reference_check(method, layer, x, physical_ids, topk_weights, gpu_out, s
 EARLY_INIT = os.environ.get("KT_GPU_STREAM_EARLY_INIT", "0") == "1"
 
 
+def _gguf_edition():
+    """The GGUF streamer module for a LLAMAFILE method."""
+    if os.environ.get("KT_GGUF_STREAM_SOURCE", "") in ("nvme", "bank"):
+        from sglang.srt.layers.moe import kt_stream_prefill_gguf_nvme as m
+    else:
+        from sglang.srt.layers.moe import kt_stream_prefill_gguf as m
+    return m
+
+
 def stream_prefill_init_early(method, layer) -> None:
     global _instance, _failed
+    if method.kt_config.method == "LLAMAFILE":
+        return _gguf_edition().stream_prefill_init_early(method, layer)
     if not EARLY_INIT or STREAM_THRESHOLD <= 0 or _failed or _instance is not None:
         return
     rank = get_parallel().tp_rank
@@ -2030,9 +2041,11 @@ def _in_lend_window() -> bool:
     return kt_lend.phase() == "prefill"
 
 
-def stream_prefill_for(method, layer, num_tokens: int) -> Optional[KTStreamPrefill]:
+def stream_prefill_for(method, layer, num_tokens: int):
     """The per-rank streamer when this call qualifies, else None."""
     global _instance, _failed
+    if method.kt_config.method == "LLAMAFILE":
+        return _gguf_edition().stream_prefill_for(method, layer, num_tokens)
     if STREAM_THRESHOLD <= 0 or _failed:
         return None
     if num_tokens < STREAM_THRESHOLD and not (IN_WINDOW and _in_lend_window()):

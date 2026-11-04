@@ -167,6 +167,272 @@ def _pinned_bounce(n: int):
     return kt_pinned.bounce(n), bool(kt_pinned.ENABLED)
 
 
+MIRROR = os.environ.get("KT_PREFILL_LEND_MIRROR", "ram")  # ram | gguf | file
+MIRROR_DIR = os.environ.get("KT_PREFILL_LEND_MIRROR_DIR", os.path.expanduser("~/.cache/kt-lend"))
+MIRROR_THREADS = int(os.environ.get("KT_PREFILL_LEND_MIRROR_THREADS", "4"))
+_MPIECE = 4 << 20
+
+
+def _mirror_bounces() -> None:
+    import concurrent.futures as cf
+
+    maxspan = max(STATE["spans"])
+    STATE["mirror"].update(
+        bounces=[_pinned_empty(((maxspan + 4095) // 4096 + 2) * 4096) for _ in range(2)],
+        pool=cf.ThreadPoolExecutor(max_workers=MIRROR_THREADS),
+        reads={},
+    )
+
+
+def _mirror_open_file(host: torch.Tensor) -> None:
+    """Write the pinned mirror to a file (O_DIRECT reads later)."""
+    import atexit
+
+    os.makedirs(MIRROR_DIR, exist_ok=True)
+    path = os.path.join(MIRROR_DIR, f"mirror-{os.getpid()}-r{_rank()}.bin")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_DIRECT, 0o600)
+    total = host.numel()
+    mv = memoryview(host.numpy())
+    tail = total % 4096
+    body = total - tail
+    t0 = time.perf_counter()
+    off = 0
+    while off < body:
+        w = os.pwritev(fd, [mv[off : off + min(_MPIECE, body - off)]], off)
+        if w <= 0:
+            raise IOError(f"mirror write failed at {off}")
+        off += w
+    if tail:
+        pad = torch.empty(4096, dtype=torch.uint8, pin_memory=True)
+        pad[:tail].copy_(host[body:])
+        os.pwritev(fd, [memoryview(pad.numpy())], body)
+    os.fsync(fd)
+    # one segment a layer: (bounce offset, bytes, "direct", (fd, file offset))
+    segs = {i: [(0, STATE["spans"][i], "direct", (fd, STATE["bases"][i]))] for i in range(len(STATE["spans"]))}
+    STATE["mirror"] = dict(mode="file", fd=fd, path=path, segs=segs, total=total)
+    _mirror_bounces()
+    atexit.register(_mirror_close)
+    _log(f"mirror of {total / 1e9:.3f} GB written to {path} in {time.perf_counter() - t0:.1f} s; "
+         f"the pinned copy is freed, two bounces of {max(STATE['spans']) >> 20} MiB stay")
+
+
+def _mirror_open_gguf(host: torch.Tensor) -> None:
+    """Every lent parameter matched to the GGUF tensor(s) holding its bytes, verified; the rest pinned."""
+    import glob
+
+    import numpy as np
+    from gguf import GGUFReader
+    from sglang.srt.server_args import get_global_server_args
+
+    gdir = os.environ.get("KT_GGUF_V41_DENSE") or get_global_server_args().kt_weight_path
+    shards = sorted(glob.glob(os.path.join(gdir, "*.gguf"))) if os.path.isdir(gdir) else [gdir]
+    t0 = time.perf_counter()
+    heads = {}  # first 4 KiB of a tensor's bytes -> (path, data offset, bytes, mmap array)
+    exps = {}  # expert tensors by name: (path, data offset, bytes, [E, rows, cols], mmap array)
+    readers = []
+    for path in shards:
+        r = GGUFReader(path)
+        readers.append(r)
+        for t in r.tensors:
+            if ".ffn_" in t.name and "_exps" in t.name:
+                exps[t.name] = (path, int(t.data_offset), int(t.n_bytes), [int(x) for x in t.shape][::-1], np.asarray(t.data))
+                continue
+            if int(t.n_bytes) < (1 << 20):
+                continue
+            a = np.asarray(t.data).reshape(-1)
+            heads.setdefault(a[:4096].tobytes(), (path, int(t.data_offset), int(t.n_bytes), a))
+    hv = host.numpy()
+    fds = {}
+    segs = {}
+    residual_parts = []  # (layer, bounce offset, bytes, host offset)
+    matched = unmatched = 0
+    for i, (lay, base) in enumerate(zip(STATE["layouts"], STATE["bases"])):
+        segs[i] = []
+        for item in lay:
+            if item[0] != "param":
+                continue
+            off, n = item[4], item[5]
+            pos = 0
+            parts = []
+            while pos < n:
+                hit = heads.get(hv[base + off + pos : base + off + pos + 4096].tobytes())
+                if hit is None or hit[2] > n - pos:
+                    break
+                path, doff, nb, a = hit
+                # the whole tensor's bytes against the mirror's
+                if not np.array_equal(a, hv[base + off + pos : base + off + pos + nb]):
+                    break
+                parts.append((off + pos, nb, path, doff))
+                pos += nb
+            if pos == n and parts:
+                for (o, nb, path, doff) in parts:
+                    if path not in fds:
+                        fds[path] = os.open(path, os.O_RDONLY)
+                    segs[i].append((o, nb, "direct", (fds[path], doff)))
+                matched += n
+                continue
+            # hot GGUF experts on the GPU (kt_gguf_hot.py): w13_qweight [E, 2N, rb] is gate then up rows of
+            # experts 0..E-1 (the base set a window puts back), w2_qweight [E, K, rb] their down rows
+            hot = _mirror_hot_segments(item, i, base + off, hv, exps)
+            if hot is not None:
+                for (o, nb, path, doff) in hot:
+                    if path not in fds:
+                        fds[path] = os.open(path, os.O_RDONLY)
+                    segs[i].append((off + o, nb, "direct", (fds[path], doff)))
+                matched += n
+                continue
+            if True:
+                residual_parts.append((i, off, n, base + off))
+                unmatched += n
+                if len(residual_parts) <= 6:
+                    _log(f"mirror: no GGUF source for layer {i} {item[1]} ({item[3]}, {n >> 20} MiB)")
+    residual = _pinned_empty(max(1, unmatched))
+    rpos = 0
+    for (i, off, n, hoff) in residual_parts:
+        residual[rpos : rpos + n].copy_(host[hoff : hoff + n])
+        segs[i].append((off, n, "pinned", rpos))
+        rpos += n
+    del readers, heads
+    STATE["mirror"] = dict(mode="gguf", fds=fds, segs=segs, residual=residual, total=host.numel())
+    _mirror_bounces()
+    _log(f"mirror from the GGUF: {matched / 1e9:.3f} GB of lent bytes matched to the shards' tensors, "
+         f"{unmatched / 1e6:.1f} MB kept pinned, matched in {time.perf_counter() - t0:.1f} s; "
+         f"the pinned copy is freed, two bounces of {max(STATE['spans']) >> 20} MiB stay")
+
+
+def _mirror_hot_why(name: str, layer_idx: int, e: int, path, a, h) -> None:
+    """The first hot slot that did not match its GGUF expert, once per launch: where the bytes differ."""
+    import numpy as np
+
+    if STATE.get("mirror_hot_why_logged"):
+        return
+    STATE["mirror_hot_why_logged"] = True
+    d = np.flatnonzero(a != h)
+    first = int(d[0]) if d.size else -1
+    _log(f"mirror: hot slot of layer {layer_idx} {name} expert {e} vs {path.split('/')[-1]}: {d.size} of {a.size} bytes differ, "
+         f"first at {first}, slot bytes zero {int((h == 0).sum())}/{h.size}, file bytes zero {int((a == 0).sum())}/{a.size}, "
+         f"slot head {h[:8].tolist()} file head {a[:8].tolist()}")
+
+
+def _mirror_hot_segments(item, layer_idx: int, hoff: int, hv, exps):
+    """Segments (param offset, bytes, path, file offset) of a hot-expert parameter, verified; None if not one."""
+    import numpy as np
+
+    name = item[1]
+    if not (name.endswith("w13_qweight") or name.endswith("w2_qweight")):
+        return None
+    try:
+        gate = exps[f"blk.{layer_idx}.ffn_gate_exps.weight"]
+        up = exps[f"blk.{layer_idx}.ffn_up_exps.weight"]
+        down = exps[f"blk.{layer_idx}.ffn_down_exps.weight"]
+    except KeyError:
+        return None
+    n = item[5]
+    segs = []
+    if name.endswith("w13_qweight"):
+        _, N, rb = gate[3][0], gate[3][1], gate[2] // (gate[3][0] * gate[3][1])
+        per = N * rb
+        E = n // (2 * per)
+        if E * 2 * per != n:
+            return None
+        o = 0
+        for e in range(E):
+            for (path, doff, nb, shape, a) in (gate, up):
+                foff = e * per
+                if not np.array_equal(a.reshape(-1)[foff : foff + per], hv[hoff + o : hoff + o + per]):
+                    _mirror_hot_why(name, layer_idx, e, path, a.reshape(-1)[foff : foff + per], hv[hoff + o : hoff + o + per])
+                    return None
+                segs.append((o, per, path, doff + foff))
+                o += per
+    else:
+        _, K, rb = down[3][0], down[3][1], down[2] // (down[3][0] * down[3][1])
+        per = K * rb
+        E = n // per
+        if E * per != n:
+            return None
+        path, doff, nb, shape, a = down
+        for e in range(E):
+            foff = e * per
+            if not np.array_equal(a.reshape(-1)[foff : foff + per], hv[hoff + e * per : hoff + (e + 1) * per]):
+                _mirror_hot_why(name, layer_idx, e, path, a.reshape(-1)[foff : foff + per], hv[hoff + e * per : hoff + (e + 1) * per])
+                return None
+            segs.append((e * per, per, path, doff + foff))
+    return segs
+
+
+def _mirror_close() -> None:
+    m = STATE.pop("mirror", None)
+    if m is None or m.get("mode") != "file":
+        return
+    try:
+        os.close(m["fd"])
+        os.unlink(m["path"])
+    except OSError:
+        pass
+
+
+def _mirror_read_layer(i: int, k: int) -> None:
+    """Layer i's bytes into bounce k: file segments in 4 MiB pieces on the pool, pinned ones copied."""
+    m = STATE["mirror"]
+    bounce = m["bounces"][k]
+    mv = memoryview(bounce.numpy())
+    futs = []
+
+    def piece(fd, foff, boff, nb, direct):
+        if direct:
+            # O_DIRECT: a 4 KiB-aligned window holding the bytes, read to the bounce at the same misalignment
+            lo = foff // 4096 * 4096
+            hi = min(-(-(foff + nb) // 4096) * 4096, -(-m["total"] // 4096) * 4096)
+            dst = boff - (foff - lo)
+            got = 0
+            while got < hi - lo:
+                r = os.preadv(fd, [mv[dst + got : dst + (hi - lo)]], lo + got)
+                if r <= 0:
+                    raise IOError(f"short mirror read at {lo + got}")
+                got += r
+        else:
+            got = 0
+            while got < nb:
+                r = os.preadv(fd, [mv[boff + got : boff + nb]], foff + got)
+                if r <= 0:
+                    raise IOError(f"short GGUF read at {foff + got}")
+                got += r
+
+    for (o, nb, kind, src) in m["segs"][i]:
+        if kind == "pinned":
+            bounce[4096 + o : 4096 + o + nb].copy_(m["residual"][src : src + nb])
+            continue
+        fd, foff = src
+        direct = m["mode"] == "file"
+        for a in range(0, nb, _MPIECE):
+            futs.append(m["pool"].submit(piece, fd, foff + a, 4096 + o + a, min(_MPIECE, nb - a), direct))
+    for f in futs:
+        f.result()
+
+
+def _mirror_view(i: int, k: int, n: int) -> torch.Tensor:
+    """The first n bytes of layer i as laid out in bounce k (the layer starts at byte 4096 of the bounce)."""
+    return STATE["mirror"]["bounces"][k][4096 : 4096 + n]
+
+
+def _mirror_submit(i: int) -> None:
+    """Layer i's bytes start reading into bounce i % 2 (whose last copy to the device must be done)."""
+    m = STATE["mirror"]
+    if i in m["reads"] or i >= len(STATE["spans"]):
+        return
+    k = i % 2
+    ev = STATE.get("pf_ready", [None, None])[k]
+    if ev is not None and STATE.get("pf_bounce_used", [False, False])[k]:
+        ev.synchronize()
+    m["reads"][i] = m["pool"].submit(_mirror_read_layer, i, k)
+
+
+def _mirror_wait(i: int) -> None:
+    m = STATE["mirror"]
+    _mirror_submit(i)
+    m["reads"].pop(i).result()
+
+
 def _pinned_empty(n: int) -> torch.Tensor:
     """The host mirror: THP + cudaHostRegister with kt_pinned (KT_FAST_PINNED=1)."""
     try:
@@ -286,9 +552,10 @@ def bind_model(model) -> None:
         lay, off, slack = [], 0, 0
         for name, p in layer.named_parameters():
             if isinstance(p, torch.nn.parameter.UninitializedParameter):
-                slack += _align(
-                    _nbytes(p)
-                )  # GGUF qweight: made by the load, taken in after it
+                if not os.environ.get("KT_GGUF_V41_DENSE"):
+                    slack += _align(
+                        _nbytes(p)
+                    )  # GGUF qweight: made by the load, taken in after it
                 continue
             if (
                 p.device.type != "cuda"
@@ -310,8 +577,10 @@ def bind_model(model) -> None:
         return
     device = entries[0][0].get_parameter(entries[0][1][0][1]).device
     dev_spans = []
+    gguf_dense = bool(os.environ.get("KT_GGUF_V41_DENSE"))
+    STATE["plain"] = set(range(len(entries))) if gguf_dense else set()
     for idx, (layer, lay, span) in enumerate(entries):
-        with _tms().region(tag=TAG_WEIGHTS):
+        with contextlib.nullcontext() if gguf_dense else _tms().region(tag=TAG_WEIGHTS):
             dspan = torch.empty(span, dtype=torch.uint8, device=device)
         for item in lay:
             _place(dspan, item).copy_(layer.get_parameter(item[1]))
@@ -352,9 +621,11 @@ def _pack_resident(layers) -> None:
         (layer, name, p)
         for layer in layers
         for name, p in layer.named_parameters()
-        if p.device.type == "cuda"
+        # (kt-lend-gguf) the name first, uninitialized GGUF parameters never touched
+        if any(w in name for w in RESIDENT)
+        and _ready(p)
+        and p.device.type == "cuda"
         and p.is_contiguous()
-        and any(w in name for w in RESIDENT)
     ]
     if not found:
         return
@@ -430,7 +701,7 @@ def _owners_after_load(layer, lay):
             inner = [
                 (n, p.data_ptr() - lo)
                 for n, p in params.items()
-                if p.is_cuda and lo <= p.data_ptr() < hi and p.is_contiguous()
+                if _ready(p) and p.is_cuda and lo <= p.data_ptr() < hi and p.is_contiguous()
             ]
             if any(n in lent for n, _ in inner):
                 found.append((mod, attr, val, inner))
@@ -560,7 +831,8 @@ def _relayout(i: int, counts) -> None:
     # of memory with KT_PREFILL_LEND_PFONLY (10-15)
     held = full.numel()
     shrink = dec < span and pf_held >= (1 << 20)
-    in_place = dec <= held and not shrink
+    in_place = dec <= held and not shrink and i not in STATE.get("plain", ())
+    STATE.get("plain", set()).discard(i)
     if in_place:
         dspan = full[:dec]
     else:
@@ -604,6 +876,7 @@ def after_module(module) -> None:
         return
     full = STATE["dev_full"][i]
     lo, hi = full.data_ptr(), full.data_ptr() + full.numel()
+    full = None
     if all(
         lo <= q.data_ptr() < hi
         for n, q in STATE["layers"][i].named_parameters()
@@ -656,6 +929,10 @@ def after_load() -> None:
         nbytes=total,
         dec_nbytes=sum(d.numel() for d in STATE["dev_spans"]),
     )
+    if MIRROR in ("file", "gguf"):
+        (_mirror_open_file if MIRROR == "file" else _mirror_open_gguf)(host)
+        STATE["host"] = None
+        del host
     maxspan = max(STATE["spans"])
     if STATE["slots"][0].numel() < maxspan:
         STATE["slots"] = None
@@ -1019,11 +1296,17 @@ def before_forward(forward_batch) -> None:
             m.hot_release("window start")
         # free memory in decode, the KV pool and the graphs made: what is gone
         # from it when the weights come back was left behind by this prefill
+        if os.environ.get("KT_GGUF_V41_DENSE"):
+            torch.cuda.empty_cache()  # the step without the decode's cached blocks
         STATE["dec_free"] = torch.cuda.mem_get_info(dev)[0]
         STATE.setdefault("dec_free0", STATE["dec_free"])
         if DEBUG and not STATE.get("history"):
             torch.cuda.memory._record_memory_history(max_entries=500000)
             STATE["history"] = True
+        # KT_HOT_DYNAMIC=1: no swap copy may land on a slot while it is lent
+        from sglang.srt.layers.moe import kt_hot_cache
+
+        kt_hot_cache.window_start()
         # Overlap scheduling may leave decode readers on these spans.
         # TMS pause unmaps them without waiting for outstanding GPU work.
         torch.cuda.synchronize(dev)
@@ -1222,10 +1505,34 @@ def end_window() -> None:
                 kt_kv_prefill_lend.swa_lend("end of window")
         _check_room(dev)
         _tms().resume(TAG_WEIGHTS)
-        for base, span, dspan in zip(
-            STATE["bases"], STATE["spans"], STATE["dev_spans"]
-        ):
-            dspan.copy_(STATE["host"][base : base + dspan.numel()], non_blocking=True)
+        if STATE.get("mirror") is not None:
+            m = STATE["mirror"]
+            for f in m["reads"].values():  # a read-ahead still landing in a bounce
+                f.result()
+            m["reads"].clear()
+            cur = torch.cuda.current_stream(dev)
+            evs = [None, None]
+            for i, dspan in enumerate(STATE["dev_spans"]):
+                k = i % 2
+                if evs[k] is not None:
+                    evs[k].synchronize()
+                _mirror_read_layer(i, k)
+                dspan.copy_(_mirror_view(i, k, dspan.numel()), non_blocking=True)
+                evs[k] = torch.cuda.Event()
+                evs[k].record(cur)
+            for ev in evs:
+                if ev is not None:
+                    ev.synchronize()
+            STATE["pf_bounce_used"] = [False, False]
+        else:
+            for base, span, dspan in zip(
+                STATE["bases"], STATE["spans"], STATE["dev_spans"]
+            ):
+                dspan.copy_(STATE["host"][base : base + dspan.numel()], non_blocking=True)
+        # KT_HOT_DYNAMIC=1: the slots a mirror restored to their load-time experts get their residents back
+        from sglang.srt.layers.moe import kt_hot_cache
+
+        kt_hot_cache.after_restore()
         STATE["phase"] = "decode"
         STATE["to_decode"] += 1
         if STATE["to_decode"] in (1, 10, 100, 1000):
@@ -1279,9 +1586,16 @@ def _prefetch(i: int) -> None:
         if STATE["pf_done"][k] is not None:
             cs.wait_event(STATE["pf_done"][k])
         n = STATE.get("active", {}).get(i, span)  # the idle tail stays out
-        STATE["slots"][k][:n].copy_(STATE["host"][base : base + n], non_blocking=True)
+        if STATE.get("mirror") is not None:
+            _mirror_wait(i)
+            STATE["slots"][k][:n].copy_(_mirror_view(i, k, n), non_blocking=True)
+            STATE.setdefault("pf_bounce_used", [False, False])[k] = True
+        else:
+            STATE["slots"][k][:n].copy_(STATE["host"][base : base + n], non_blocking=True)
         STATE["pf_ready"][k].record(cs)
     STATE["pf_issued"].add(i)
+    if STATE.get("mirror") is not None:
+        _mirror_submit(i + 1)
 
 
 def _enter_hook(module, args):

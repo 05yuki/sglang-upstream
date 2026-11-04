@@ -14,12 +14,17 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+# the prefill lend's calibration server measures GPU memory only: with a GGUF pack the CPU experts
+# are skipped there
+_CALIBRATING = os.environ.get("KT_PREFILL_LEND_CALIBRATING") == "1" and bool(os.environ.get("KT_GGUF_V41_DENSE"))
+
 from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.layers.moe.kt_handoff_pack import (
     PACK as _KT_HANDOFF_PACK,
     SHARED_AFTER_SUBMIT as _KT_SHARED_AFTER_SUBMIT,
     pack_to_host,
 )
+from sglang.srt.layers.moe import kt_hot_cache
 from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
@@ -330,7 +335,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
             # kt_kv_hot_lend's dynamic resident rows: kt-kernel loads every expert, the
             # routes say what it computes (-1 for what the GPU takes)
-            if not kt_kv_hot_lend.cpu_holds_all(self):
+            # KT_HOT_DYNAMIC=1 (kt_hot_cache.py): the slots hold what the cache put there and the CPU
+            # gets the logical ids with the residents set to -1, so kt-kernel must not skip ids on its own
+            if not kt_kv_hot_lend.cpu_holds_all(self) and not kt_hot_cache.ENABLED:
                 gpu_mask[: self.num_gpu_experts] = True
             KT_LAYERS[self.kt_config.layer_idx] = self
             self.wrapper = KTMoEWrapper(
@@ -399,6 +406,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_init_early
 
             stream_prefill_init_early(self, layer)
+        kt_hot_cache.register(self, layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -439,7 +447,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             "Only SiLU activation is supported."
         )
 
-        if self.tp_rank != 0 or self.wrapper is None:
+        if self.tp_rank != 0 or self.wrapper is None or _CALIBRATING:
             return
 
         x = dispatch_output.hidden_states
@@ -484,7 +492,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Returns:
             CPU expert computation results
         """
-        if self.tp_rank != 0 or self.wrapper is None:
+        if self.tp_rank != 0 or self.wrapper is None or _CALIBRATING:
             return torch.zeros_like(x)
 
         # Wait for CPU computation and retrieve results
@@ -570,6 +578,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # their slots, and to the CPU at weight 0
         hot = kt_kv_hot_lend.route(self, dispatch_output) if streamer is None else None
 
+        # KT_HOT_DYNAMIC=1 (kt_hot_cache.py): the GPU slots follow the decode's routing; the tables give
+        # the CPU the logical ids minus the resident ones and the GPU method the slot ids
+        if streamer is None and kt_hot_cache.ENABLED and kt_hot_cache._cache is not None and kt_hot_cache._cache.ready:
+            slot_ids, cpu_ids = kt_hot_cache._cache.route(self.kt_config.layer_idx, topk_output.topk_ids)
+            if self.tp_rank == 0:
+                self.submit(layer, dispatch_output._replace(topk_output=topk_output._replace(topk_ids=cpu_ids)))
+            output = self.gpu_method.apply(
+                layer, dispatch_output._replace(topk_output=topk_output._replace(topk_ids=slot_ids))
+            ).hidden_states
+            if self.tp_rank == 0:
+                output = output + self.sync(x)
+            return StandardCombineInput(hidden_states=output)
+
         # Step 1: Submit CPU expert computation (non-blocking)
         if streamer is None and self.tp_rank == 0:
             self.submit(layer, hot[0] if hot is not None else dispatch_output)
@@ -608,7 +629,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # experts (--kt-num-gpu-experts 0, every slot given to the streamer
         # and the KV pool) there is nothing to run and the FlashInfer MXFP4
         # runner refuses a zero-expert workspace (09-16).
-        if self.num_gpu_experts > 0:
+        if self.num_gpu_experts > 0 and not (
+            streamer is not None
+            and getattr(self.gpu_method, "streams_hot_experts", False)
+        ):
             gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
             output = gpu_combine_input.hidden_states
             if streamer is not None and _hot_check:
@@ -622,7 +646,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 4: Synchronize CPU results and merge with GPU results
         if streamer is not None:
-            output = output + streamer.run(self, layer, dispatch_output, physical_ids)
+            if getattr(streamer, "accumulates_into", False) and output.is_contiguous() and \
+                    output.untyped_storage().data_ptr() != x.untyped_storage().data_ptr():
+                # the GGUF MMQ streamer adds into the output: no chunk-sized accumulator and no sum
+                output = streamer.run(self, layer, dispatch_output, physical_ids, into=output)
+            else:
+                output = output + streamer.run(self, layer, dispatch_output, physical_ids)
             if cpu_share:
                 output = output + self.sync(x)
         elif self.tp_rank == 0:
