@@ -1886,6 +1886,10 @@ class ModelRunner:
             from sglang.srt.layers.moe import kt_lend
 
             kt_lend.before_forward(forward_batch)
+            # the lazily mapped RoPE tables reach this batch's positions
+            from sglang.srt.layers import lazy_rope_table
+
+            lazy_rope_table.ensure(forward_batch)
             output = self._forward_raw(forward_batch, pp_proxy_tensors)
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
